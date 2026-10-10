@@ -1,0 +1,33 @@
+# Environment and secrets
+# ---------------------------------------------------------------
+# CRITICAL: this file must exist BEFORE the first commit, not after.
+# Git remembers everything. Once an API key or connection string is
+# committed, removing it in a later commit does NOT remove it from
+# history -- the value stays recoverable forever, and rotating every
+# key becomes the only fix.
+.venv/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+.azure/
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Data artefacts -- regenerable from the simulator, so not worth the bytes
+data/
+outputs/
+*.parquet
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,4 @@
+# Pinned to major versions. Exact pinning arrives in Phase 1 once the full
+# stack is chosen, because a lockfile you cannot regenerate is worse than none.
+pydantic>=2.9
+numpy>=2.0
