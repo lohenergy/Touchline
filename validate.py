@@ -45,6 +45,12 @@ from simulator import DEMO_AWAY, DEMO_HOME, MatchSimulator
 REFERENCE: dict[str, tuple[float, float, str]] = {
     "goals_per_match": (2.4, 3.2, "both teams combined"),
     "shots_per_match": (20.0, 30.0, "both teams combined"),
+    "shots_in_box_pct": (55.0, 75.0, "share of shots from inside the penalty area"),
+    "woodwork_per_match": (0.5, 2.0, "both teams combined"),
+    "saves_per_match": (4.0, 9.0, "both teams combined"),
+    "blocks_per_match": (4.0, 12.0, "both teams combined"),
+    "big_chances_per_match": (2.0, 6.0, "both teams combined (latent truth)"),
+    "errors_per_match": (0.5, 4.0, "unforced giveaways, both teams (latent truth)"),
     "shots_on_target_per_match": (7.0, 11.0, "both teams combined"),
     "xg_per_match": (2.2, 3.4, "should track goals closely"),
     "xg_per_shot": (0.08, 0.14, "shot quality as a rate"),
@@ -88,6 +94,12 @@ def measure_one(seed: int) -> dict[str, float]:
     return {
         "goals_per_match": float(total_goals),
         "shots_per_match": float(total_shots),
+        "shots_in_box_pct": 100.0
+        * sum(1 for e in events if e.type == EventType.SHOT and e.in_box)
+        / max(1, total_shots),
+        "woodwork_per_match": float(sum(sim.woodwork.values())),
+        "saves_per_match": float(sum(sim.saves.values())),
+        "blocks_per_match": float(sum(sim.blocks.values())),
         "shots_on_target_per_match": float(sum(sim.shots_on_target.values())),
         "xg_per_match": total_xg,
         "xg_per_shot": total_xg / max(1, total_shots),
@@ -105,6 +117,12 @@ def measure_one(seed: int) -> dict[str, float]:
         "yellow_cards_per_match": float(sum(sim.yellows.values())),
         "red_cards_per_match": float(sum(sim.reds.values())),
         "substitutions_per_match": float(sum(sim.substitutions.values())),
+        "big_chances_per_match": float(
+            sum(1 for t in sim.truth_series() if t.big_chance_true)
+        ),
+        "errors_per_match": float(
+            sum(1 for t in sim.truth_series() if t.error_true)
+        ),
     }
 
 

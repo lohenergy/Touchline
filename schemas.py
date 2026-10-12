@@ -68,6 +68,8 @@ class EventType(StrEnum):
     SHOT = "shot"
     TACKLE = "tackle"
     INTERCEPTION = "interception"
+    SAVE = "save"
+    BLOCK = "block"
     OFFSIDE = "offside"
     CORNER = "corner"
     POSSESSION_CHANGE = "possession_change"
@@ -100,6 +102,7 @@ class Outcome(StrEnum):
     TACKLED = "tackled"
     BLOCKED = "blocked"
     OFF_TARGET = "off_target"
+    WOODWORK = "woodwork"
     ON_TARGET = "on_target"
     SAVED = "saved"
     GOAL = "goal"
@@ -219,6 +222,11 @@ class MatchEvent(BaseModel):
     y: float = Field(ge=0, le=100)
     end_x: float | None = Field(default=None, ge=0, le=100)
     end_y: float | None = Field(default=None, ge=0, le=100)
+    in_box: bool | None = Field(
+        default=None,
+        description="SHOT only: was the shot taken from inside the penalty area? "
+        "A broadcaster can see that, so it is observable.",
+    )
 
     # --- derived football features ----------------------------------------- #
     # These exist because the hackathon brief explicitly asks for them:
@@ -279,6 +287,30 @@ class LatentState(BaseModel):
         default=None,
         description="On PASS snapshots only: the true kind of the pass. Ground "
         "truth for the Phase 1 geometric pass classifier. Never on the event.",
+    )
+    big_chance_true: bool | None = Field(
+        default=None,
+        description="On SHOT snapshots only: the true chance tier. A 'big chance' "
+        "is an analyst-coded, subjective stat in real football; here it is decided "
+        "on latent quality (noisy relative to the observable xG), so recovering it "
+        "from events is a real learning task with a labelled answer.",
+    )
+    chance_created_true: bool | None = Field(
+        default=None,
+        description="On the single PASS snapshot that manufactured a big chance. "
+        "Ground truth for the 'chances created' stat and the creator attribution.",
+    )
+    error_true: bool | None = Field(
+        default=None,
+        description="On PASS snapshots only: an unforced give-away deep in the "
+        "possession side's own third that hands the opposition a chance. Another "
+        "analyst-coded stat (errors) that we can label because we generated the game.",
+    )
+    from_error_true: bool | None = Field(
+        default=None,
+        description="On SHOT snapshots only: this shot was the direct product of "
+        "an error. Closes the causal chain error -> giveaway -> chance, so the "
+        "error-to-chance attribution can be scored.",
     )
 
 

@@ -22,8 +22,16 @@ from __future__ import annotations
 
 from collections import Counter
 
-from schemas import CardType, EventType, MatchEvent
-from simulator import DEMO_AWAY, DEMO_HOME, MatchSimulator
+from schemas import CardType, EventType, MatchEvent, Outcome
+from simulator import (
+    BIG_CHANCE_NOISE,
+    BIG_CHANCE_QUALITY,
+    DEFENSIVE_THIRD_X,
+    DEMO_AWAY,
+    DEMO_HOME,
+    MatchSimulator,
+    in_box,
+)
 
 # A pass or shot tells us who currently has the ball.
 POSSESSION_MARKERS = {EventType.PASS, EventType.SHOT}
@@ -170,6 +178,10 @@ def test_observable_events_carry_no_latent_state() -> None:
         "chaos",
         "dominant_team",
         "pass_type_true",
+        "big_chance_true",
+        "chance_created_true",
+        "error_true",
+        "from_error_true",
     }
     forbidden &= set(MatchEvent.model_fields)
     assert not forbidden, f"latent fields leaked into MatchEvent: {forbidden}"
@@ -286,6 +298,219 @@ def test_loose_ball_count_matches_contest_counter() -> None:
             assert sim.contests <= loose <= 2 * sim.contests, (
                 f"contests={sim.contests} loose_balls={loose}"
             )
+
+
+# --------------------------------------------------------------------------- #
+# 7. The objective trio (Phase 0.6)
+# --------------------------------------------------------------------------- #
+def test_every_saved_shot_has_a_save_event() -> None:
+    """A keeper save is an observable act by a named keeper, paired 1:1."""
+    for events in all_matches():
+        saved = [
+            e for e in events
+            if e.type == EventType.SHOT and e.outcome == Outcome.SAVED
+        ]
+        saves = [e for e in events if e.type == EventType.SAVE]
+        assert len(saved) == len(saves), (
+            f"{len(saved)} saved shots but {len(saves)} SAVE events"
+        )
+        prev_shot: MatchEvent | None = None
+        for e in events:
+            if e.type == EventType.SHOT and e.outcome == Outcome.SAVED:
+                prev_shot = e
+            elif e.type == EventType.SAVE:
+                assert prev_shot is not None, "SAVE event with no saved shot before it"
+                assert e.team != prev_shot.team, f"save credited to the shooter: {e}"
+
+
+def test_every_blocked_shot_has_a_block_event() -> None:
+    """A shot block is an observable act by a named defender, paired 1:1."""
+    for events in all_matches():
+        blocked = [
+            e for e in events
+            if e.type == EventType.SHOT and e.outcome == Outcome.BLOCKED
+        ]
+        blocks = [e for e in events if e.type == EventType.BLOCK]
+        assert len(blocked) == len(blocks), (
+            f"{len(blocked)} blocked shots but {len(blocks)} BLOCK events"
+        )
+        prev_shot: MatchEvent | None = None
+        for e in events:
+            if e.type == EventType.SHOT and e.outcome == Outcome.BLOCKED:
+                prev_shot = e
+            elif e.type == EventType.BLOCK:
+                assert prev_shot is not None, "BLOCK event with no blocked shot before it"
+                assert e.team != prev_shot.team, f"block credited to the shooter: {e}"
+
+
+def test_woodwork_is_a_separate_outcome() -> None:
+    """A strike on the frame is neither a goal nor a shot on target."""
+    strikes = 0
+    for seed in range(N_MATCHES):
+        sim = MatchSimulator(DEMO_HOME, DEMO_AWAY, match_id=f"T{seed:04d}", seed=seed)
+        sim.simulate(live=True)
+        events = list(sim.observable_stream())
+        ww = [
+            e for e in events
+            if e.type == EventType.SHOT and e.outcome == Outcome.WOODWORK
+        ]
+        strikes += len(ww)
+        assert sum(sim.woodwork.values()) == len(ww), (
+            "woodwork counter disagrees with the event stream"
+        )
+        on_target = sum(sim.shots_on_target.values())
+        assert on_target + len(ww) <= sum(sim.shots.values()), (
+            "woodwork must not be counted as a shot on target"
+        )
+    assert strikes > 0, "no woodwork strikes observed across 40 matches"
+
+
+def test_in_box_is_geometrically_consistent() -> None:
+    """The observed in_box flag must match the shot's origin geometry.
+
+    Recompute the check from the *absolute* coordinates using the same fixed
+    frame the simulator uses (home attacks toward x=100, away toward x=0), so
+    the test does not just re-read a field the simulator already set.
+    """
+
+    def local(team_id: str, x: float, y: float) -> tuple[float, float]:
+        if team_id == DEMO_HOME.team_id:
+            return x, y
+        return 100.0 - x, 100.0 - y  # away's attacking-local frame is mirrored
+
+    for events in all_matches():
+        for e in events:
+            if e.type != EventType.SHOT:
+                continue
+            lx, ly = local(e.team, e.x, e.y)
+            assert e.in_box == in_box(lx, ly), (
+                f"in_box={e.in_box} inconsistent with origin ({e.x}, {e.y})"
+            )
+
+
+# --------------------------------------------------------------------------- #
+# 8. Ground truth stays latent: big chances and errors (Phase 0.6)
+# --------------------------------------------------------------------------- #
+def test_big_chance_true_only_on_shots_with_bounded_consistency() -> None:
+    """The big-chance tier is latent, on shots only, and bounded by observable xG.
+
+    The tier is decided on latent quality with uniform noise, so the bounds are
+    *exact* and this is a hard invariant, not a statistical one: a TRUE tier
+    requires observable shot_quality at least one noise-width below the
+    threshold, and a FALSE one at most one noise-width above it.
+    """
+    for seed in range(N_MATCHES):
+        sim = MatchSimulator(DEMO_HOME, DEMO_AWAY, match_id=f"T{seed:04d}", seed=seed)
+        sim.simulate(live=True)
+        for event, latent in sim.snapshots:
+            if event.type == EventType.SHOT:
+                assert latent.big_chance_true is not None, event
+                assert event.shot_quality is not None, event
+                if latent.big_chance_true:
+                    assert event.shot_quality >= BIG_CHANCE_QUALITY - BIG_CHANCE_NOISE, (
+                        f"tiered big chance at xG {event.shot_quality:.3f}"
+                    )
+                else:
+                    assert event.shot_quality <= BIG_CHANCE_QUALITY + BIG_CHANCE_NOISE, (
+                        f"tiered non-chance at xG {event.shot_quality:.3f}"
+                    )
+            else:
+                assert latent.big_chance_true is None, event
+
+
+def test_creator_pass_always_yields_a_big_chance() -> None:
+    """chance_created_true marks the pass that manufactured a big chance.
+
+    A marked pass must be followed directly (only pressure events may intervene)
+    by a big-chance shot from the same team. Some big chances come from
+    set-piece restarts with no creator pass, so the creator count can be lower
+    than the big-chance count -- never higher.
+    """
+    creators = 0
+    big_chances = 0
+    for seed in range(N_MATCHES):
+        sim = MatchSimulator(DEMO_HOME, DEMO_AWAY, match_id=f"T{seed:04d}", seed=seed)
+        sim.simulate(live=True)
+        snaps = sim.snapshots
+        for i, (event, latent) in enumerate(snaps):
+            if event.type == EventType.SHOT and latent.big_chance_true:
+                big_chances += 1
+            if not (event.type == EventType.PASS and latent.chance_created_true):
+                continue
+            creators += 1
+            j = i + 1
+            while j < len(snaps):
+                ev, lat = snaps[j]
+                if ev.type == EventType.PRESSURE:
+                    j += 1
+                    continue
+                assert ev.type == EventType.SHOT, (
+                    f"creator pass not followed directly by a shot (got {ev.type.value})"
+                )
+                assert ev.team == event.team, "creator pass credited the wrong team"
+                assert lat.big_chance_true is True, (
+                    f"creator pass did not yield a big chance ({ev.event_id})"
+                )
+                break
+    assert creators <= big_chances, f"{creators} creators for {big_chances} big chances"
+    assert big_chances > 0, "no big chances observed across 40 matches"
+
+
+def test_error_flags_carried_only_on_the_right_events() -> None:
+    """error_true marks failed defensive-third passes; from_error marks shots.
+
+    The observable side of an error is an INCOMPLETE pass by the team in
+    possession, deep in that team's own third. The gift's consequence -- a
+    shot -- carries from_error_true. The error itself is never observable.
+    """
+    for seed in range(N_MATCHES):
+        sim = MatchSimulator(DEMO_HOME, DEMO_AWAY, match_id=f"T{seed:04d}", seed=seed)
+        sim.simulate(live=True)
+        for event, latent in sim.snapshots:
+            if event.type == EventType.PASS and latent.error_true:
+                assert event.outcome == Outcome.INCOMPLETE, event
+                if event.team == DEMO_HOME.team_id:
+                    assert event.x < DEFENSIVE_THIRD_X, event
+                else:
+                    assert event.x > 100.0 - DEFENSIVE_THIRD_X, event
+            elif event.type == EventType.SHOT:
+                assert latent.from_error_true is not None, event
+            else:
+                assert latent.error_true is None, event
+                assert latent.from_error_true is None, event
+
+
+def test_every_from_error_shot_follows_an_error() -> None:
+    """A shot can only be error-gifted after an opposing deep giveaway.
+
+    Walk back from each error-gifted shot: before any possession change away
+    from the shot's team, a defensive-third error pass by the other team must
+    appear -- closing the chain error -> giveaway -> chance.
+    """
+    error_shots = 0
+    for seed in range(N_MATCHES):
+        sim = MatchSimulator(DEMO_HOME, DEMO_AWAY, match_id=f"T{seed:04d}", seed=seed)
+        sim.simulate(live=True)
+        snaps = sim.snapshots
+        for i, (event, latent) in enumerate(snaps):
+            if event.type != EventType.SHOT or not latent.from_error_true:
+                continue
+            error_shots += 1
+            found_error = False
+            j = i - 1
+            while j >= 0:
+                ev, lat = snaps[j]
+                if ev.type == EventType.PASS and lat.error_true and ev.team != event.team:
+                    found_error = True
+                    break
+                if ev.type in (EventType.OFFSIDE, EventType.POSSESSION_CHANGE):
+                    if ev.team != event.team:
+                        break  # possession had flipped away before the error
+                j -= 1
+            assert found_error, (
+                f"error-gifted shot {event.event_id} has no preceding giveaway"
+            )
+    assert error_shots >= 1, "no error-gifted shots across 40 matches"
 
 
 if __name__ == "__main__":

@@ -251,6 +251,50 @@ CLOCK_LOOSE_BALL_S = (3, 9)
 XG_BASE = 0.65
 XG_DISTANCE_DECAY = 0.14
 
+# --- penalty-area geometry -------------------------------------------------- #
+# Normalised pitch coordinates. A shot is "inside the box" when its origin lies
+# in the penalty area of the goal being attacked. The box is a real, visible
+# region of the pitch, so `in_box` rides on the SHOT event -- a broadcaster can
+# plainly see whether a strike came from inside the area.
+BOX_DEPTH_M = 16.5   # goal-line to the edge of the box
+BOX_WIDTH_M = 40.32  # width of the penalty area
+BOX_X_MIN = 100.0 - 100.0 * BOX_DEPTH_M / PITCH_LEN_M              # ~84.3
+BOX_Y_MIN = (PITCH_WID_M - BOX_WIDTH_M) / 2.0 / PITCH_WID_M * 100.0  # ~20.4
+BOX_Y_MAX = 100.0 - BOX_Y_MIN
+
+# --- shot outcomes ---------------------------------------------------------- #
+# This share of shots hit the frame and miss (post or crossbar). A deliberately
+# narrow band: roughly one woodwork strike per ~29-shot match.
+P_SHOT_WOODWORK = 0.03
+
+# --- big chances (latent) --------------------------------------------------- #
+# A "big chance" is an analyst-coded, subjective stat in real football -- there
+# is no label for it in Opta or Statsbomb, only a human's judgement. Here the
+# simulator produces the label, because it *generated* the chance. The tier is
+# decided on a LATENT quality that carries a little noise the observable xG does
+# not, so a downstream classifier recovering the tier from events faces a real
+# learning task instead of reading the answer off the shot_quality field.
+BIG_CHANCE_QUALITY = 0.35
+BIG_CHANCE_NOISE = 0.04  # uniform half-width; bounded, so invariants stay exact
+
+# --- unforced errors (latent) ---------------------------------------------- #
+# An "error leading to a chance" is the other analyst-coded stat we get to
+# label. We model it as a failed pass deep in the possessing side's own third
+# that hands the ball straight to the opposition with a gift chance. The
+# probability scales with latent chaos -- that causal link is the trace that
+# makes errors recoverable from the event stream, exactly like control and
+# pass intent.
+DEFENSIVE_THIRD_X = 32.0  # attacking-local: own defensive third is lx < 32
+P_ERROR_BASE = 0.004
+P_ERROR_CHAOS = 0.05
+ERROR_CHANCE_BONUS_XG = 0.12  # the give-away gifts a better chance than the position
+
+
+
+def in_box(lx: float, ly: float) -> bool:
+    """True if an attacking-local point (lx, ly) is inside the penalty area."""
+    return lx >= BOX_X_MIN and BOX_Y_MIN <= ly <= BOX_Y_MAX
+
 # Fictional name pools. Deterministic selection means a given seed always
 # produces the same league -- reproducibility is not a nicety here, it is what
 # lets us compare two runs of an experiment and trust the difference.
@@ -316,6 +360,12 @@ class MatchSimulator:
         self._sub_window_idx = 0
         self.contests = 0  # loose-ball phases
 
+        # Phase 0.6 objective stats (the cheap trio).
+        self.shots_in_box = {home.team_id: 0, away.team_id: 0}
+        self.woodwork = {home.team_id: 0, away.team_id: 0}
+        self.saves = {home.team_id: 0, away.team_id: 0}
+        self.blocks = {home.team_id: 0, away.team_id: 0}
+
         # --- clock and period --- #
         # `clock_s` is monotonic, so the display clock has to be derived. These
         # track where the current period began in wall-clock terms.
@@ -346,6 +396,15 @@ class MatchSimulator:
 
         self.snapshots: list[Snapshot] = []
         self._event_seq = 0
+
+        # --- sequence tracking for latent attributions ---------------------- #
+        # Index of the possessor's most recent completed pass, so a big-chance
+        # shot can credit "chance created" to the pass that manufactured it.
+        # Cleared whenever possession changes hands or a sequence resets.
+        self._last_passer_idx: int | None = None
+        # True while an unforced error has gifted the current possessor a chance.
+        # Consumed (or expired) on the next shot -- see _shoot.
+        self._error_chance_pending = False
 
     # ------------------------------------------------------------------ #
     # Setup
@@ -449,7 +508,14 @@ class MatchSimulator:
             return Phase.CHAOTIC
         return Phase.CONTESTED
 
-    def _latent(self, pass_type_true: PassType | None = None) -> LatentState:
+    def _latent(
+        self,
+        pass_type_true: PassType | None = None,
+        big_chance_true: bool | None = None,
+        chance_created_true: bool | None = None,
+        error_true: bool | None = None,
+        from_error_true: bool | None = None,
+    ) -> LatentState:
         dominant = (
             self.home.team_id if self.control >= 0 else self.away.team_id
         )
@@ -461,6 +527,10 @@ class MatchSimulator:
             dominant_team=dominant,
             phase=self._phase(),
             pass_type_true=pass_type_true,
+            big_chance_true=big_chance_true,
+            chance_created_true=chance_created_true,
+            error_true=error_true,
+            from_error_true=from_error_true,
         )
 
     # ------------------------------------------------------------------ #
@@ -552,6 +622,11 @@ class MatchSimulator:
         player_out_id: str | None = None,
         stoppage: StoppageBreakdown | None = None,
         pass_type_true: PassType | None = None,
+        in_box: bool | None = None,
+        big_chance_true: bool | None = None,
+        chance_created_true: bool | None = None,
+        error_true: bool | None = None,
+        from_error_true: bool | None = None,
         **features: float | None,
     ) -> None:
         """Record one event together with the latent state that produced it."""
@@ -576,9 +651,21 @@ class MatchSimulator:
             y=round(y, 2),
             end_x=None if end_x is None else round(end_x, 2),
             end_y=None if end_y is None else round(end_y, 2),
+            in_box=in_box,
             **features,
         )
-        self.snapshots.append(Snapshot(event=event, latent=self._latent(pass_type_true)))
+        self.snapshots.append(
+            Snapshot(
+                event=event,
+                latent=self._latent(
+                    pass_type_true=pass_type_true,
+                    big_chance_true=big_chance_true,
+                    chance_created_true=chance_created_true,
+                    error_true=error_true,
+                    from_error_true=from_error_true,
+                ),
+            )
+        )
 
     # ------------------------------------------------------------------ #
     # Football logic
@@ -718,6 +805,19 @@ class MatchSimulator:
         let the main loop hand the ball to the opposition anyway. The stream
         looked fine -- every event type was present -- and the semantics were
         wrong. `test_events.py` is what caught it.
+
+        Phase 0.6 additions, each justified by "feeds a claim OR is ground
+        truth that scores one":
+          * in_box is computed from the shot origin (observable -- you can see
+            it on the screen) and feeds "kept them to long-range efforts".
+          * SAVE and BLOCK get their own events so the keeper and the blocker
+            are attributable, not anonymous aggregates.
+          * big_chance_true lives in the latent channel: the tier is decided on
+            a slightly noisy copy of latent quality, so recovering it from
+            observables is a real learning task with a label.
+          * if possession was gifted by an unforced error, the shot gets a
+            quality bonus and from_error_true: the error's consequence is
+            visible, the error itself is not.
         """
         team = self.home if team_id == self.home.team_id else self.away
         shooter = self._pick_player(
@@ -736,23 +836,55 @@ class MatchSimulator:
         )
         quality = _clamp(quality, 0.0, 0.95)
 
+        # An unforced error gifts the opposition a better chance than the
+        # position alone deserves. The bonus is applied to everything the shot
+        # carries; the *gift* flag itself stays latent, because nothing on an
+        # event stream ever says "this came from a mistake" -- a downstream
+        # detector has to infer that from the giveaway it can see.
+        from_error = self._error_chance_pending
+        self._error_chance_pending = False
+        if from_error:
+            quality = _clamp(quality + ERROR_CHANCE_BONUS_XG, 0.0, 0.95)
+
         # Expected goals IS the probability of scoring -- that is the definition.
+        # A "big chance" is decided on a latent copy of quality with bounded
+        # noise, so the tier is correlated with, but not equal to, the xG any
+        # observer could compute for themselves.
+        latent_quality = _clamp(
+            quality + self.rng.uniform(-BIG_CHANCE_NOISE, BIG_CHANCE_NOISE),
+            0.0,
+            1.0,
+        )
+        big_chance = latent_quality >= BIG_CHANCE_QUALITY
+
         roll = self.rng.random()
         if roll < quality:
             outcome = Outcome.GOAL
         elif roll < quality + 0.24:
             outcome = Outcome.SAVED
-        elif roll < quality + 0.54:
+        elif roll < quality + 0.24 + P_SHOT_WOODWORK:
+            outcome = Outcome.WOODWORK
+        elif roll < quality + 0.54 + P_SHOT_WOODWORK:
             outcome = Outcome.OFF_TARGET
         else:
             outcome = Outcome.BLOCKED
 
-        shot_speed = _clamp(self.rng.gauss(95.0, 18.0) * (0.85 + 0.3 * shooter.finishing), 40.0, 140.0)
+        shot_speed = _clamp(
+            self.rng.gauss(95.0, 18.0) * (0.85 + 0.3 * shooter.finishing),
+            40.0,
+            140.0,
+        )
 
         self.shots[team_id] += 1
         self.shot_quality[team_id] += quality
+        shot_in_box = in_box(lx, ly)
+        if shot_in_box:
+            self.shots_in_box[team_id] += 1
         if outcome in (Outcome.GOAL, Outcome.SAVED):
             self.shots_on_target[team_id] += 1
+        elif outcome == Outcome.WOODWORK:
+            # A strike on the frame is NOT a shot on target.
+            self.woodwork[team_id] += 1
 
         sx, sy = self._to_absolute(team_id, lx, ly)
         ex, ey = self._to_absolute(team_id, 100.0, ly)
@@ -766,11 +898,27 @@ class MatchSimulator:
             y=sy,
             end_x=ex,
             end_y=ey,
+            in_box=shot_in_box,
+            big_chance_true=big_chance,
+            from_error_true=from_error,
             shot_quality=round(quality, 4),
             shot_speed_kmh=round(shot_speed, 1),
             ball_speed_kmh=round(shot_speed, 1),
             pressure_at_location=round(self._pressure(team_id, lx), 3),
         )
+
+        # Credit the pass that manufactured the chance. Only the most recent
+        # completed pass by this team counts -- it is the one that unlocked the
+        # shot -- and it must have been played with no possession change since
+        # (the index is cleared on every turnover/restart).
+        if big_chance and self._last_passer_idx is not None:
+            creator = self.snapshots[self._last_passer_idx]
+            if creator.event.team == team_id and creator.event.type == EventType.PASS:
+                self.snapshots[self._last_passer_idx] = Snapshot(
+                    creator.event,
+                    creator.latent.model_copy(update={"chance_created_true": True}),
+                )
+        self._last_passer_idx = None
 
         if outcome == Outcome.GOAL:
             self.score[team_id] += 1
@@ -789,6 +937,37 @@ class MatchSimulator:
             self.clock_s += self.rng.randint(*CLOCK_SHOT_SAVED_S)
         else:
             self.clock_s += self.rng.randint(*CLOCK_SHOT_OTHER_S)
+
+        # The keeper and the blocker are named actors, so a save and a block get
+        # their own observable events (and a count). Both belong to the team NOT
+        # shooting, and both are emitted immediately after the shot they answer.
+        defender_id = (
+            self.away.team_id if team_id == self.home.team_id else self.home.team_id
+        )
+        if outcome == Outcome.SAVED:
+            keeper = self._pick_player(defender_id, {"GK": 1.0})
+            self.saves[defender_id] += 1
+            self._emit(
+                event_type=EventType.SAVE,
+                team_id=defender_id,
+                player=keeper,
+                outcome=Outcome.COMPLETE,
+                x=ex,
+                y=ey,
+            )
+        elif outcome == Outcome.BLOCKED:
+            blocker = self._pick_player(
+                defender_id, {"DEF": 4.0, "MID": 2.0, "FWD": 0.5}
+            )
+            self.blocks[defender_id] += 1
+            self._emit(
+                event_type=EventType.BLOCK,
+                team_id=defender_id,
+                player=blocker,
+                outcome=Outcome.COMPLETE,
+                x=sx,
+                y=sy,
+            )
 
         # A blocked shot deflects behind for a corner reasonably often. A corner
         # is restarted by the ATTACKING side, so this retains possession -- which
@@ -1090,6 +1269,9 @@ class MatchSimulator:
             # supersedes the pass, so only the offside appears in the stream.
             if progressive and lx > 70.0 and self.rng.random() < P_OFFSIDE:
                 self.clock_s += self._emit_offside(team_id, ex, ey)
+                # The sequence is dead: any pending creator/gift is void.
+                self._last_passer_idx = None
+                self._error_chance_pending = False
                 winner_id = away_id if team_id == home_id else home_id
                 self._set_phase(winner_id)
                 self._possessor = winner_id
@@ -1097,6 +1279,12 @@ class MatchSimulator:
                 continue
 
             ball_speed = _clamp(distance_m * 2.4 + self.rng.gauss(0, 6), 8.0, 110.0)
+
+            is_error = (
+                not completed
+                and lx < DEFENSIVE_THIRD_X
+                and self.rng.random() < P_ERROR_BASE + P_ERROR_CHAOS * self.chaos
+            )
 
             self._emit(
                 event_type=EventType.PASS,
@@ -1109,10 +1297,15 @@ class MatchSimulator:
                 pressure_at_location=round(pressure, 3),
                 ball_speed_kmh=round(ball_speed, 1),
                 pass_type_true=pass_type,
+                error_true=is_error or None,
             )
             self.clock_s += self.rng.randint(1, 4)
 
             if completed:
+                # The most recent completed pass is the candidate "creator" for
+                # any big-chance shot that follows before possession changes.
+                # It is cleared on every turnover and restart.
+                self._last_passer_idx = len(self.snapshots) - 1
                 self._lx, self._ly = tx, ty
                 attack_third = tx > 68.0
 
@@ -1131,12 +1324,17 @@ class MatchSimulator:
                         # touched here. (The original draft both blamed the wrong
                         # team and handed over the ball -- see _emit_foul.)
                         self.clock_s += self._emit_foul(team_id, ex, ey)
+                        # A dead-ball restart resets the sequence: the previous
+                        # pass did not "create" anything that follows.
+                        self._last_passer_idx = None
                         continue
 
                     if attack_third and r < P_BREAKUP_FOUL + P_BREAKUP_ATTACK_THIRD_CORNER:
                         # Deflected behind by a defender: a corner, restarted by
                         # the attacking side, so possession is likewise retained.
                         self.clock_s += self._emit_corner(team_id, ex, ey)
+                        # Set-piece restart: the creator chain restarts here.
+                        self._last_passer_idx = None
                         continue
 
                     # Otherwise possession genuinely turns over. Two flavours
@@ -1147,6 +1345,10 @@ class MatchSimulator:
                     else:
                         delay = self.rng.randint(*CLOCK_TURNOVER_OPEN_S)
 
+                    # Possession genuinely changes hands: pending creator/gift
+                    # die here, before the loose-ball contest is even decided.
+                    self._last_passer_idx = None
+                    self._error_chance_pending = False
                     winner_id = self._resolve_turnover(team_id, ex, ey)
                     winner = self._pick_player(
                         winner_id, {"DEF": 4.0, "MID": 3.0, "FWD": 1.0}
@@ -1169,11 +1371,39 @@ class MatchSimulator:
                         self._lx, self._ly = 100.0 - lx, 100.0 - ly
                 continue
 
+            # An unforced error: the give-away hands the ball straight over in a
+            # dangerous area, bypassing the normal loose-ball contest. The PASS
+            # event above already carried error_true in its latent channel; the
+            # observable trace is the failed pass deep in their own third and the
+            # immediate turnover that follows.
+            if is_error:
+                self._error_chance_pending = True
+                self._last_passer_idx = None
+                winner_id = away_id if team_id == home_id else home_id
+                winner = self._pick_player(
+                    winner_id, {"DEF": 4.0, "MID": 3.0, "FWD": 1.0}
+                )
+                self._emit(
+                    event_type=EventType.POSSESSION_CHANGE,
+                    team_id=winner_id,
+                    player=winner,
+                    outcome=Outcome.COMPLETE,
+                    x=ex, y=ey,
+                )
+                self._shock_control(winner_id, 0.03)
+                self.clock_s += self.rng.randint(1, 3)
+                self._set_phase(winner_id)
+                self._possessor = winner_id
+                self._lx, self._ly = 100.0 - tx, 100.0 - ty
+                continue
+
             # --- pass failed: the opposition wins it ---------------------------- #
             # The challenger gets a foot in FIRST; whether they end up with the
             # ball is a separate question, decided by _resolve_turnover. Keeping
             # "won the tackle" and "has possession" apart is what lets a loose
             # ball exist at all.
+            self._last_passer_idx = None
+            self._error_chance_pending = False
             challenger_id = away_id if team_id == home_id else home_id
             challenger = self._pick_player(
                 challenger_id, {"DEF": 4.0, "MID": 3.5, "FWD": 1.0}
@@ -1328,6 +1558,12 @@ def _summary(sim: MatchSimulator) -> str:
         f"  shots               {sim.home.name} {sim.shots[h]}  {sim.away.name} {sim.shots[a]}",
         f"  on target           {sim.home.name} {sim.shots_on_target[h]}  "
         f"{sim.away.name} {sim.shots_on_target[a]}",
+        f"  in box              {sim.home.name} {sim.shots_in_box[h]}  "
+        f"{sim.away.name} {sim.shots_in_box[a]}",
+        f"  woodwork            {sum(sim.woodwork.values())}  "
+        f"(H {sim.woodwork[h]} / A {sim.woodwork[a]})",
+        f"  saves               H {sim.saves[h]}  / A {sim.saves[a]}",
+        f"  blocks              H {sim.blocks[h]}  / A {sim.blocks[a]}",
         f"  total xG            {sim.home.name} {sim.shot_quality[h]:.2f}  "
         f"{sim.away.name} {sim.shot_quality[a]:.2f}",
         f"  completion (H/A)    {pc(h_passes):.1f}%  /  {pc(a_passes):.1f}%",
@@ -1340,6 +1576,10 @@ def _summary(sim: MatchSimulator) -> str:
         f"  substitutions       {sim.substitutions[h]} - {sim.substitutions[a]}",
         f"  loose-ball contests {sim.contests}",
         f"  pass types          {pass_type_line}",
+        f"  big chances         {sum(1 for t in sim.truth_series() if t.big_chance_true)}  "
+        f"(created-marked {sum(1 for t in sim.truth_series() if t.chance_created_true)})",
+        f"  errors              {sum(1 for t in sim.truth_series() if t.error_true)}  "
+        f"(led to a shot {sum(1 for t in sim.truth_series() if t.from_error_true)})",
         f"  added time          1H +{mmss(sim.added_time_s[1])}   "
         f"2H +{mmss(sim.added_time_s[2])}",
     ]
@@ -1355,7 +1595,8 @@ def main() -> None:
     print("\n--- sample of the observable stream (what the agents will see) ---")
     interesting = [
         e for e in sim.observable_stream()
-        if e.type in (EventType.SHOT, EventType.PRESSURE, EventType.KICKOFF,
+        if e.type in (EventType.SHOT, EventType.SAVE, EventType.BLOCK,
+                      EventType.PRESSURE, EventType.KICKOFF,
                       EventType.LOOSE_BALL, EventType.CARD)
     ][:8]
     for e in interesting:
