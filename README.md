@@ -63,12 +63,16 @@ The pipeline follows the brief's five stages:
 ## Repository layout
 
 ```
-schemas.py      Domain contracts: MatchEvent, LatentState, MatchState (+ pass
-                types, stoppage ledger, contested possession, save/block/
+schemas.py      Domain contracts: MatchEvent, LatentState, MatchState, MatchSummary
+                (+ pass types, stoppage ledger, contested possession, save/block/
                 woodwork events, in-box geometry, big-chance/error truth)
 simulator.py    Synthetic match generator (observable events + latent ground truth)
+metrics.py      Interpret stage: observable events -> MatchState / MatchSummary
 validate.py     Calibration harness: does the synthetic data look like football?
 test_events.py  Invariant tests: is the event stream semantically correct?
+test_metrics.py Tests: can the match be rebuilt from observables alone?
+server.py       Web surface: FastAPI + SSE console (pitch, live strip, ticker,
+                full-time summary) — one long-lived stream, no build step
 ```
 
 ---
@@ -90,6 +94,66 @@ rate, which lengthens their sequences, which produces more final-third entries
 and more shots. That causal chain is what makes control recoverable from events
 alone — and it is why the explanations are non-trivial.
 
+## The Interpret stage: meaning from events alone
+
+`metrics.py` is the layer that turns events into *meaning*. Its one rule: it may
+read observable events and nothing else — it does not import the simulator at
+all, so it has no way to reach the latent truth. That is the event-contract
+discipline pushed one stage downstream: an interpretation must be *recoverable
+from what a camera could see*, or it is not an interpretation.
+
+Possession here is a *time* decomposition, not a pass count. Every second between
+two events is attributed to home, away, or a contested (loose-ball) phase using
+only observable cues, and the three buckets sum to the elapsed clock by
+construction (`test_metrics.py` asserts it). The objective record it rebuilds —
+score, shots, saves, blocks, woodwork, xG, discipline, added time — equals the
+simulator's own counters, which were computed from full internal state rather
+than from the stream. Agreement is a real check, not a tautology.
+
+Two quantities make no claim of accuracy: `control` and `chaos`. Phase 1 ships
+transparent *baselines* for them — a rolling possession share, and the recent
+share of unstructured events — and Phase 2 learns better estimators and scores
+them against `control_true` / `chaos_true`. A weak, *measured* baseline is worth
+more than a confident, unfalsifiable one.
+
+## The web surface: one stream, four surfaces
+
+`server.py` is the *composition root* — the one place where the pieces are
+assembled behind HTTP (a Telegram bot's `main.py`, with routes instead of
+handlers). It serves one page and one long-lived SSE stream, and emits five
+kinds of frame:
+
+```
+meta     match identity, once, at the start
+event    the raw observable event stream (the Ingest layer)
+state    a periodic MatchState, rebuilt by metrics.py
+summary  the full-time MatchSummary, just before the stream closes
+done     terminal marker
+```
+
+The page renders three live surfaces — the pitch, the live numbers, and the event
+ticker — plus a fourth that is *revealed* rather than browsed: the full-time
+summary, which is the metrics engine given a face.
+
+The pitch is an honest action map, drawn to scale (105m × 68m). **Every mark is
+one real event**, and nothing is invented between them. The actor disc appears at
+the actor's *true* `(x, y)` with their shirt number, then fades — it never
+glides, because animating position between two events would be manufacturing
+motion the data does not contain. Lenses are client-side filters over the same
+event list, so the server never has to know what the viewer is looking at:
+
+| Lens | Shows |
+|---|---|
+| **Action** | every event, with pass/shot lines and the actor disc |
+| **Passing** | passes only; green complete / red incomplete; thickness = difficulty |
+| **Possession** | where each team's play happens (territory) — one dot per event |
+| **Shots & xG** | shots only; radius grows with xG; colour = outcome |
+
+One connection carries everything, and every frame is built from observables.
+The `MatchMetrics` instance in the server is fed exactly the events it sends —
+the same bytes the browser receives — so the interpretation can only ever know
+what the viewer knows.
+
 ## Running it
 
 ```bash
@@ -98,8 +162,12 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 python simulator.py        # generate one match and print a summary
+python metrics.py          # interpret one match; print the full-time summary
 python validate.py 120     # calibration report over 120 matches
 python test_events.py      # invariant tests on the event stream
+python test_metrics.py     # tests: the match rebuilt from observables alone
+
+python -m uvicorn server:app --reload   # the console, at http://127.0.0.1:8000
 ```
 
 `validate.py` exits non-zero if any metric falls outside its reference range, so
@@ -251,7 +319,7 @@ validated separately in later layers.
 
 ## Status
 
-Phase 0 complete — and Phase 0.6 (the stat bundle) with it:
+Phase 0 complete, and Phase 0.6 (the stat bundle) with it:
 
 - **Phase 0**: contracts and simulator, including the completed event stream
   (offsides, corners, cards, substitutions), stoppage time with an explainable
@@ -262,9 +330,25 @@ Phase 0 complete — and Phase 0.6 (the stat bundle) with it:
   made measurable — *big chances* and *errors leading to chances* — carried as
   latent ground truth that downstream classifiers will be scored against.
   21 invariant tests and 25 calibrated metrics green.
+- **Phase 1 (started)**: the Interpret stage (`metrics.py`) rebuilds a match's
+  objective record from observable events alone — score, shots, saves, blocks,
+  woodwork, xG, passes, discipline, added time, and a *time-based* possession
+  decomposition with contested time. `test_metrics.py` checks the reconstruction
+  against the simulator's own counters and asserts the possession buckets sum to
+  the clock. `control` and `chaos` ship as transparent baselines, to be learned
+  and scored against `control_true` / `chaos_true` in Phase 2.
+- **Phase 1 (web surface)**: `server.py` streams one SSE connection carrying
+  `meta` / `event` / `state` / `summary` / `done`. The page renders the event
+  ticker, a live numbers strip from periodic `state` frames, and — revealed at
+  full time — the `summary`, which is the metrics engine given a face.
+- **Phase 1 (pitch renderer)**: the action map, drawn to scale, with four
+  client-side lenses (Action, Passing, Possession, Shots & xG) and numbered actor
+  discs at the actor's true position that fade rather than glide. Shirt numbers
+  are a new observable on `MatchEvent` (a camera can read them), guarded by an
+  invariant test.
 
-Next — the metrics engine that turns events into `MatchState` (`metrics.py`),
-then the geometric pass classifier scored against `pass_type_true`.
+Next — the geometric pass classifier scored against `pass_type_true`, then the
+explainer (`explainer.py`) and overlay payloads (`overlay.py`).
 
 All clubs, players and matches are fictional. No real football data, trademarks
 or match footage are used.

@@ -80,6 +80,21 @@ def test_card_type_only_on_cards() -> None:
                 assert e.card_type is None, e
 
 
+def test_shirt_numbers_are_present_and_stable() -> None:
+    """Every event names a player who keeps a readable, stable shirt number.
+
+    The overlay draws a numbered disc on the actor, and a number is exactly the
+    kind of thing a broadcast camera can see. Stability matters too: the same
+    player must not wear two numbers in one match, or the disc would misidentify
+    who acted.
+    """
+    for seed in range(N_MATCHES):
+        seen: dict[str, int] = {}
+        for e in collect(seed):
+            assert 1 <= e.player_number <= 99, e
+            assert seen.setdefault(e.player_id, e.player_number) == e.player_number, e
+
+
 # --------------------------------------------------------------------------- #
 # 2. Football semantics (the bug this file was written to trap)
 # --------------------------------------------------------------------------- #

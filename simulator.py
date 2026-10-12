@@ -99,6 +99,7 @@ class PlayerProfile:
     name: str
     team_id: str
     position: str  # GK | DEF | MID | FWD
+    number: int  # shirt number -- visible to a broadcast camera
     skill: float  # passing / technique, 0..1
     finishing: float  # 0..1
 
@@ -413,6 +414,10 @@ class MatchSimulator:
     def _build_squad(self, team: TeamProfile) -> list[PlayerProfile]:
         """Build a 4-3-3 from the frozen name pools."""
         layout = [("GK", 1), ("DEF", 4), ("MID", 3), ("FWD", 3)]
+        # Classic 4-3-3 shirt numbers, parallel to `layout`. A viewer reads the
+        # number off the back, and the overlay draws it on the actor disc -- so
+        # this is observable, not a rendering convenience.
+        numbers = {"GK": [1], "DEF": [2, 3, 4, 5], "MID": [6, 8, 10], "FWD": [7, 9, 11]}
         squad: list[PlayerProfile] = []
         for position, count in layout:
             for i in range(count):
@@ -443,6 +448,7 @@ class MatchSimulator:
                         name=f"{first} {last}",
                         team_id=team.team_id,
                         position=position,
+                        number=numbers[position][i],
                         skill=round(skill, 3),
                         finishing=round(finishing, 3),
                     )
@@ -643,6 +649,7 @@ class MatchSimulator:
             team=team_id,
             player_id=player.player_id,
             player_name=player.name,
+            player_number=player.number,
             outcome=outcome,
             card_type=card_type,
             player_out_id=player_out_id,

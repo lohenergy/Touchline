@@ -205,6 +205,13 @@ class MatchEvent(BaseModel):
         description="Human-readable name. The brief requires real-time player "
         "name tagging, and an overlay cannot render an opaque synthetic id."
     )
+    player_number: int = Field(
+        ge=0,
+        le=99,
+        description="Shirt number. A broadcast camera can read it off the back, "
+        "so it is observable -- and it is what the overlay draws on an actor disc. "
+        "Colour alone could not tell two players of the same team apart.",
+    )
     outcome: Outcome
     card_type: CardType | None = Field(
         default=None, description="Set on CARD events only."
@@ -348,16 +355,92 @@ class MatchState(BaseModel):
         "ball. This is the time-based answer to 'who had the ball?' -- pass "
         "count alone cannot express it.",
     )
-    control: dict[str, float]
-    control_trend: float = Field(
-        description="Rate of change of control over the rolling window. "
-        "Large magnitudes are what make a moment 'matter'."
+    control: dict[str, float] = Field(
+        description="Per-team share of control, summing to 1, read from a "
+        "rolling observable window. Phase 1 ships a deliberately transparent "
+        "baseline (current rolling possession share); Phase 2 learns a better "
+        "estimator and scores it against control_true. A baseline is not an "
+        "answer -- it is the thing you measure improvement against."
     )
-    chaos: float = Field(ge=0, le=1)
+    control_trend: float = Field(
+        description="Signed rate of change of the control margin (home share "
+        "minus away share) over the rolling window, per minute. Large "
+        "magnitudes are what make a moment 'matter'."
+    )
+    chaos: float = Field(
+        ge=0,
+        le=1,
+        description="Observable baseline for how unstructured the game is: the "
+        "share of recent events that are turnovers, loose balls, offsides or "
+        "incomplete passes. Phase 2 scores it against chaos_true.",
+    )
     tempo: float = Field(ge=0, description="Events per minute over the rolling window")
 
-    territory: dict[str, float]
+    territory: dict[str, float] = Field(
+        description="Field tilt: each team's share of final-third passes, "
+        "renormalised to sum to 1. A spatial read that possession alone hides."
+    )
+    pass_completion: dict[str, float] = Field(
+        description="Completed / attempted passes, per team, in 0..1."
+    )
+    pass_difficulty_mean: dict[str, float] = Field(
+        description="Mean pass_difficulty of each team's passes, in 0..100."
+    )
+    shot_quality_total: dict[str, float] = Field(
+        description="Cumulative xG per team (sum of shot_quality)."
+    )
+    shots: dict[str, int] = Field(description="Shot count per team.")
+
+
+# --------------------------------------------------------------------------- #
+# The full-time summary -- what a highlights package shows on the final whistle
+# --------------------------------------------------------------------------- #
+
+
+class MatchSummary(BaseModel):
+    """The full-time, observable-only aggregate behind the summary screen.
+
+    This is the same shape a broadcast app shows on the whistle -- possession,
+    shots, xG, discipline -- computed entirely from the event stream.
+
+    It deliberately contains NO latent truth. "Big chances" and "errors" are
+    analyst-coded AND live in `LatentState`, so this summary cannot report them
+    as fact; only an inferred, scored estimator (Phase 2) may put them on
+    screen. A summary that quietly printed the ground truth would look
+    authoritative and be exactly the unfalsifiable claim this project exists to
+    avoid.
+    """
+
+    match_id: str
+    home: str
+    away: str
+    home_name: str
+    away_name: str
+
+    score: dict[str, int]
+
+    possession: dict[str, float] = Field(description="Controlled-time share, 0..1.")
+    contested_pct: float = Field(ge=0, le=100, description="Loose-ball time, percent.")
+
+    shots: dict[str, int]
+    shots_on_target: dict[str, int]
+    shots_in_box: dict[str, int]
+    woodwork: dict[str, int]
+    saves: dict[str, int]
+    blocks: dict[str, int]
+    xg: dict[str, float]
+
+    passes: dict[str, int]
     pass_completion: dict[str, float]
     pass_difficulty_mean: dict[str, float]
-    shot_quality_total: dict[str, float]
-    shots: dict[str, int]
+
+    corners: dict[str, int]
+    offsides: dict[str, int]
+    fouls: dict[str, int]
+    yellows: dict[str, int]
+    reds: dict[str, int]
+    substitutions: dict[str, int]
+
+    territory: dict[str, float]
+    added_time_s: dict[int, int] = Field(default_factory=dict)
+    stoppage: dict[int, StoppageBreakdown] = Field(default_factory=dict)
