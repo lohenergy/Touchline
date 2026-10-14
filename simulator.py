@@ -75,6 +75,11 @@ REGULATION_S = 5400  # 90 minutes
 HALF_S = REGULATION_S // 2  # 45 minutes
 GOAL_CENTER_Y_M = PITCH_WID_M / 2
 
+GOAL_WIDTH_M = 7.32  # a regulation goal
+# Half the goal mouth, in the same 0..100 lateral units the frame uses. A shot
+# aimed beyond this is off target; aimed at it, it clipped a post.
+GOAL_HALF_WIDTH = (GOAL_WIDTH_M / 2.0) / PITCH_WID_M * 100.0  # ~5.38
+
 
 # --------------------------------------------------------------------------- #
 # Profiles -- the "personality" of a synthetic team and player
@@ -473,6 +478,40 @@ class MatchSimulator:
         if self._attack_dir(team_id) == 1:
             return lx, ly
         return 100.0 - lx, 100.0 - ly
+
+    def _shot_target(
+        self, team_id: str, lx: float, ly: float, outcome: Outcome
+    ) -> tuple[float, float]:
+        """Where a shot was aimed, in the fixed frame.
+
+        A shot's destination is a real, observable thing: a viewer can see
+        whether the ball nestled in the corner, clipped a post, flew wide, or
+        was blocked before it arrived. An earlier draft returned the goal-line
+        at the shooter's own lateral position, which made every shot a
+        horizontal line to the byline -- a wide shot looked like it simply went
+        out of play, and a goal looked identical to a miss. Aiming at the frame
+        by outcome fixes the picture and makes the endpoint mean something.
+        """
+        half = GOAL_HALF_WIDTH
+        if outcome in (Outcome.GOAL, Outcome.SAVED):
+            # On target: inside the posts. Scored and saved shots both finish in
+            # the goal mouth; the difference is the keeper, not the location.
+            ty = 50.0 + self.rng.uniform(-0.78 * half, 0.78 * half)
+            tx = 100.0
+        elif outcome == Outcome.WOODWORK:
+            # On the frame: exactly at one post.
+            ty = 50.0 + (half if self.rng.random() < 0.5 else -half)
+            tx = 100.0
+        elif outcome == Outcome.OFF_TARGET:
+            # Wide: past the post, still on the goal-line plane.
+            side = 1.0 if self.rng.random() < 0.5 else -1.0
+            ty = 50.0 + side * self.rng.uniform(1.15 * half, 3.2 * half)
+            tx = 100.0
+        else:  # BLOCKED: stopped in flight, short of the goal-line.
+            frac = self.rng.uniform(0.30, 0.70)
+            tx = lx + (100.0 - lx) * frac
+            ty = ly + (50.0 - ly) * frac
+        return self._to_absolute(team_id, tx, ty)
 
     def _goal_distance_m(self, lx: float, ly: float) -> float:
         """Distance to the centre of the goal being attacked, in metres."""
@@ -894,7 +933,7 @@ class MatchSimulator:
             self.woodwork[team_id] += 1
 
         sx, sy = self._to_absolute(team_id, lx, ly)
-        ex, ey = self._to_absolute(team_id, 100.0, ly)
+        ex, ey = self._shot_target(team_id, lx, ly, outcome)
 
         self._emit(
             event_type=EventType.SHOT,

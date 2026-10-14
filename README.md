@@ -135,19 +135,57 @@ The page renders three live surfaces — the pitch, the live numbers, and the ev
 ticker — plus a fourth that is *revealed* rather than browsed: the full-time
 summary, which is the metrics engine given a face.
 
+**The client owns the clock.** The server streams the match as fast as it can
+produce it; the page buffers the events and advances a *playhead* at a speed the
+viewer chooses, so pause, speed, replay and "new match" need no cooperation from
+the server. (This is the fix for the first honest failure of the renderer: at the
+old fixed pace a full match flew past at ~19 events/second, so passes were
+unreadable. Pacing belongs where the controls are.) Playback auto-pauses on a
+goal, a chance, or the half-time whistle so the eye can land on it, then resumes;
+reaching full time reveals the summary instead of pausing.
+
 The pitch is an honest action map, drawn to scale (105m × 68m). **Every mark is
-one real event**, and nothing is invented between them. The actor disc appears at
-the actor's *true* `(x, y)` with their shirt number, then fades — it never
-glides, because animating position between two events would be manufacturing
-motion the data does not contain. Lenses are client-side filters over the same
-event list, so the server never has to know what the viewer is looking at:
+one real event**, and nothing is invented between them. The actor disc sits at
+the actor's *true* `(x, y)` with their shirt number and **jumps** between events —
+it never glides, because animating position between two events would be
+manufacturing motion the data does not contain. Lenses are client-side filters
+over the same event list, so the server never has to know what the viewer is
+looking at:
 
 | Lens | Shows |
 |---|---|
 | **Action** | every event, with pass/shot lines and the actor disc |
-| **Passing** | passes only; green complete / red incomplete; thickness = difficulty |
+| **Passing** | passes only; green complete / red incomplete; **thickness = distance** (short / medium / long); the current possession sequence stays bright while older play dims |
 | **Possession** | where each team's play happens (territory) — one dot per event |
-| **Shots & xG** | shots only; radius grows with xG; colour = outcome |
+| **Shots & xG** | shots only; the ball marks the strike and grows with xG; a dashed line runs to the target; colour = outcome (goal / saved / woodwork / blocked / off target) |
+
+Width encodes **distance, not difficulty**, deliberately: a stylised width is a
+*visible* property of the pass, whereas difficulty is our own opinion and belongs
+in a claim the explainer must defend, not in a stroke.
+
+The shot's destination is geometry-honest: a goal or a save finishes inside the
+posts, woodwork exactly on a post, a miss beyond it, and a block short of the
+line. The first draft sent *every* shot to the byline at the shooter's own
+lateral position, which made a wide shot look like it went out of play and a goal
+look like a miss. That looked like a rendering bug but was a **data** bug: the
+shot endpoint is decided in the simulator, so it was fixed there, where the
+outcome is known — the renderer only draws what it is given.
+
+**Key moments are observable only.** The legend names three: a possession change
+(yellow), a *chance* — a shot in the box or with xG above a threshold (green),
+and a *deep giveaway* — an incomplete pass in the passer's own third (red). The
+simulator's latent "big chance" and "error leading to a chance" tiers never
+appear here; they exist to be scored in Phase 2, and putting them on the analyst
+surface would be exactly the leakage the project forbids. What the viewer sees is
+what a viewer could see.
+
+**The live strip is two-sided wherever the stat is.** Possession is a *share*, so
+the strip reads `poss 55% – 45%` — a lone "55%" would read as if one team owned
+the ball. The same split is painted faintly (~12% opacity) across the pitch, one
+number per half, as a headline you can read at a glance without it competing with
+the event marks. Possession here is the time-based figure derived from
+observables, so it belongs on the analyst surface. The ticker lists events
+**newest first**, so the latest action is always in view without scrolling.
 
 One connection carries everything, and every frame is built from observables.
 The `MatchMetrics` instance in the server is fed exactly the events it sends —
@@ -343,9 +381,22 @@ Phase 0 complete, and Phase 0.6 (the stat bundle) with it:
   full time — the `summary`, which is the metrics engine given a face.
 - **Phase 1 (pitch renderer)**: the action map, drawn to scale, with four
   client-side lenses (Action, Passing, Possession, Shots & xG) and numbered actor
-  discs at the actor's true position that fade rather than glide. Shirt numbers
+  discs at the actor's true position that jump rather than glide. Shirt numbers
   are a new observable on `MatchEvent` (a camera can read them), guarded by an
   invariant test.
+- **Phase 1 (playback + key moments)**: the client owns the clock — play/pause,
+  speed presets, replay, "new match" and six curated seed presets, with auto-pause
+  on goals, chances and the half-time whistle. Shots became outcome-aware in the
+  simulator (goal / save inside the posts, woodwork on a post, miss beyond it,
+  block short of the line; verified geometrically over 30 matches). Passes gained
+  a distance-encoded thickness and a bright current-possession sequence; key
+  moments (possession change, chance, deep giveaway) got ticker highlighting and a
+  legend. All observable-only.
+- **Phase 1 (surface polish)**: possession is shown two-sided in the strip and
+  painted faintly on the pitch, one number per half; the ticker runs newest-first;
+  the full-time card gained a substitutions row; replay now clears the live
+  numbers rather than briefly showing the previous run's. Presentation only — no
+  new quantity reaches the analyst surface.
 
 Next — the geometric pass classifier scored against `pass_type_true`, then the
 explainer (`explainer.py`) and overlay payloads (`overlay.py`).
