@@ -140,6 +140,7 @@ async def _stream_match(seed: int) -> AsyncIterator[str]:
         ),
     )
 
+    ht_emitted = False
     for i, event in enumerate(sim.observable_stream()):
         # Only the OBSERVABLE stream is sent. The latent ground truth (control,
         # chaos, pass intent, big-chance/error labels) never crosses this
@@ -150,6 +151,9 @@ async def _stream_match(seed: int) -> AsyncIterator[str]:
 
         if (i + 1) % STATE_EVERY_N_EVENTS == 0:
             yield _sse("state", metrics.state().model_dump_json())
+        if not ht_emitted and event.type.value == "half_time":
+            yield _sse("htsummary", metrics.summary().model_dump_json())
+            ht_emitted = True
 
     # Full time: the aggregate the summary screen renders.
     yield _sse("summary", metrics.summary().model_dump_json())
@@ -394,7 +398,7 @@ INDEX_HTML = """<!doctype html>
           <span class="ft-score" id="ft-score">0 – 0</span>
           <span id="ft-away"></span>
         </div>
-        <div class="ft-sub">Full time</div>
+        <div class="ft-sub" id="ft-sub">Full time</div>
       </div>
       <div id="ft-rows"></div>
       <div class="ft-foot" id="ft-foot"></div>
@@ -439,7 +443,7 @@ INDEX_HTML = """<!doctype html>
   let speed = 30;            // match-seconds per real second
   let lastTs = null;         // null until the first animation frame
   let pauseUntil = 0;        // auto-pause deadline, ms
-  let summaryData = null, doneFlag = false, summaryShown = false;
+  let summaryData = null, htData = null, doneFlag = false, summaryShown = false, htSummaryShown = false, pausedForHt = false;
   let lastPossTeam = null;   // for detecting possession-change moments
   let es = null;
 
@@ -756,8 +760,30 @@ INDEX_HTML = """<!doctype html>
     clockEl.textContent = clock(e) + "'";
     // Auto-pause on a goal, a chance, or the half-time whistle. Full time needs
     // no pause here -- reaching the last event reveals the summary.
-    return e.type === "half_time" ||
-      (e.type === "shot" && e.outcome === "goal") || km === "chance";
+
+    if (e.type === "half_time" && !htSummaryShown) {
+      if (htData && HOME) {
+        renderHtSummary(htData);
+      } else {
+        // Fallback minimal
+        if (HOME) {
+          el("ft-home").textContent = matchup.textContent.split(" vs ")[0];
+          el("ft-away").textContent = matchup.textContent.split(" vs ")[1] || "";
+        }
+        el("ft-score").textContent = scoreEl.textContent;
+        el("ft-rows").innerHTML = "";
+        el("ft-foot").textContent = "";
+        el("ft-sub").textContent = "Half time";
+      }
+      htSummaryShown = true;
+      pausedForHt = true;
+      playing = false;
+      updatePlayBtn();
+      el("summary").classList.remove("hidden");
+      pauseUntil = Number.POSITIVE_INFINITY;
+      return true;
+    }
+    return (e.type === "shot" && e.outcome === "goal") || km === "chance";
   }
 
   function advance(ts) {
@@ -831,7 +857,15 @@ INDEX_HTML = """<!doctype html>
   // The full-time card is a reveal, not a trap: click the backdrop to go back to
   // the pitch. Replay or a new match will reveal it again.
   el("summary").onclick = (ev) => {
-    if (ev.target === el("summary")) el("summary").classList.add("hidden");
+    if (ev.target === el("summary")) {
+      el("summary").classList.add("hidden");
+      if (pausedForHt) {
+        pausedForHt = false;
+        playing = true;
+        updatePlayBtn();
+        pauseUntil = 0;
+      }
+    }
   };
   el("newmatch").onclick = () => {
     const typed = el("seedin").value.trim();
@@ -861,6 +895,7 @@ INDEX_HTML = """<!doctype html>
     el("chips").innerHTML = "";
     if (homePct) homePct.textContent = "";
     if (awayPct) awayPct.textContent = "";
+    htSummaryShown = false; pausedForHt = false; htData = null;
     el("summary").classList.add("hidden");
   }
 
@@ -891,12 +926,59 @@ INDEX_HTML = """<!doctype html>
       // it at the right point in the timeline rather than on arrival.
       stateFrames.push({ at: events.length, data: JSON.parse(msg.data) });
     });
+    es.addEventListener("htsummary", (msg) => { htData = JSON.parse(msg.data); });
     es.addEventListener("summary", (msg) => { summaryData = JSON.parse(msg.data); });
     es.addEventListener("done", () => { doneFlag = true; if (es) es.close(); });
     es.onerror = () => setStatus("reconnecting…", false);
   }
 
   // ---- the full-time reveal -------------------------------------------- //
+  function renderHtSummary(s) {
+    el("ft-home").textContent = s.home_name;
+    el("ft-away").textContent = s.away_name;
+    el("ft-score").textContent = s.score[HOME] + " – " + s.score[AWAY];
+    const rows = el("ft-rows");
+    rows.innerHTML = "";
+    const pct = (v) => (v * 100).toFixed(0) + "%";
+    const num = (v) => String(v);
+    const dec = (v) => v.toFixed(2);
+    const row = (label, hv, av, fmt) => {
+      const total = hv + av;
+      const homeShare = total > 0 ? (hv / total * 100) : 50;
+      const d = document.createElement("div");
+      d.className = "row";
+      d.innerHTML =
+        '<span class="hv">' + fmt(hv) + "</span>" +
+        '<span class="lbl">' + label + "</span>" +
+        '<span class="av">' + fmt(av) + "</span>" +
+        '<div class="bar"><i style="width:' + homeShare + '%"></i></div>';
+      rows.appendChild(d);
+    };
+    const H = HOME, A = AWAY;
+    row("Possession", s.possession[H], s.possession[A], pct);
+    row("Shots", s.shots[H], s.shots[A], num);
+    row("On target", s.shots_on_target[H], s.shots_on_target[A], num);
+    row("In the box", s.shots_in_box[H], s.shots_in_box[A], num);
+    row("Woodwork", s.woodwork[H], s.woodwork[A], num);
+    row("Saves", s.saves[H], s.saves[A], num);
+    row("Blocks", s.blocks[H], s.blocks[A], num);
+    row("Expected goals", s.xg[H], s.xg[A], dec);
+    row("Passes", s.passes[H], s.passes[A], num);
+    row("Pass accuracy", s.pass_completion[H], s.pass_completion[A], pct);
+    row("Corners", s.corners[H], s.corners[A], num);
+    row("Offsides", s.offsides[H], s.offsides[A], num);
+    row("Fouls", s.fouls[H], s.fouls[A], num);
+    row("Yellow cards", s.yellows[H], s.yellows[A], num);
+    row("Red cards", s.reds[H], s.reds[A], num);
+    row("Substitutions", s.substitutions[H], s.substitutions[A], num);
+    const at = s.added_time_s || {};
+    const mmss = (x) => Math.floor(x / 60) + ":" + String(x % 60).padStart(2, "0");
+    let foot = "contested ball " + s.contested_pct.toFixed(1) + "%";
+    if (at["1"] != null) foot += " · added time " + mmss(at["1"]) + " + " + mmss(at["2"] || 0);
+    el("ft-foot").textContent = foot;
+    el("ft-sub").textContent = "Half time";
+  }
+
   function renderSummary(s) {
     el("ft-home").textContent = s.home_name;
     el("ft-away").textContent = s.away_name;
@@ -943,6 +1025,7 @@ INDEX_HTML = """<!doctype html>
     let foot = "contested ball " + s.contested_pct.toFixed(1) + "%";
     if (at["1"] != null) foot += " · added time " + mmss(at["1"]) + " + " + mmss(at["2"] || 0);
     el("ft-foot").textContent = foot;
+    el("ft-sub").textContent = "Full time";
   }
 
   // ---- boot ------------------------------------------------------------- //
