@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 # --------------------------------------------------------------------------- #
@@ -444,3 +444,153 @@ class MatchSummary(BaseModel):
     territory: dict[str, float]
     added_time_s: dict[int, int] = Field(default_factory=dict)
     stoppage: dict[int, StoppageBreakdown] = Field(default_factory=dict)
+
+
+# --------------------------------------------------------------------------- #
+# The Explain stage -- key moments, attributed to cited observable evidence
+# --------------------------------------------------------------------------- #
+
+
+class InsightKind(StrEnum):
+    """The key-moment kinds the Explain stage recognises.
+
+    Every member is *observable*. A goal and a chance are visible on the pitch;
+    a deep giveaway is a failed pass in the passer's own third. Nothing here
+    names a latent quantity: "big chance" and "error" live in `LatentState`, and
+    they are exactly what these observable moments are later *scored* against.
+    """
+
+    GOAL = "goal"
+    CHANCE = "chance"
+    DEEP_GIVEAWAY = "deep_giveaway"
+
+
+class ReasonKind(StrEnum):
+    """What a reason is *claiming*.
+
+    A renderer styles these differently, and -- more importantly -- the scoring
+    harness selects them structurally. Tagging the claim means the audit reads
+    `reason.kind == CREATOR` rather than `reason.text.startswith("Built from")`,
+    which would break the day someone rewords a sentence. Same discipline as the
+    rest of the project: address data by structure, never by its English.
+
+    There is deliberately **no CAUSE** member. The tempting claim is "this chance
+    came from that give-away", and the synthetic truth lets us grade it: only
+    ~4% of deep give-aways are genuine errors, and the tape offers nothing to
+    separate them from the rest, so the claim has a precision ceiling near 0.03.
+    An analyst who said it aloud would be wrong nineteen times in twenty. The
+    give-away is surfaced as its own observable moment instead -- never as the
+    cause of a later one. See `score_explanations` for the measurement.
+    """
+
+    ORIGIN = "origin"        # where the shot came from: box, distance, xG
+    CREATOR = "creator"      # the completed pass that built it
+    SCORELINE = "scoreline"  # what a goal did to the score
+    LOCATION = "location"    # how deep a give-away was
+    PRESSURE = "pressure"    # pressure at the time
+
+
+class InsightReason(BaseModel):
+    """One attributable reason a moment matters, bound to the events that show it.
+
+    `event_ids` is not decoration -- it is the audit trail. A reason is a claim
+    about what happened, and a claim with no evidence is exactly the
+    unfalsifiable commentary this project exists to avoid. If a sentence cannot
+    point at events a viewer can already see, it does not belong here.
+
+    Two citation conventions are relied on (and pinned by `test_explainer.py`):
+    a CREATOR reason cites `[anchor, the passing event]`, and a LOCATION reason
+    cites `[anchor]`. That is how the scoring harness reaches back from a claim
+    to the single pass it is checking.
+    """
+
+    kind: ReasonKind
+    text: str = Field(description="One short, human sentence.")
+    event_ids: list[str] = Field(
+        min_length=1,
+        description="The observable events this sentence is true because of.",
+    )
+
+
+class Insight(BaseModel):
+    """A key moment, plus the cited reasons why it matters.
+
+    Output of the Explain stage, input to the Narrator and the overlay. It
+    carries no latent truth and no free-floating prose: every reason points at
+    real events, so any claim can be traced back to what actually happened.
+    """
+
+    insight_id: str
+    match_id: str
+    clock_s: int
+    period: int
+    minute: int = Field(ge=0, le=90)
+    kind: InsightKind
+    team: str = Field(description="The protagonist: the shooter or the passer.")
+    anchor_event_id: str = Field(
+        description="The event this moment *is* -- the shot, or the give-away. "
+        "Its id doubles as the join key so a renderer can line the insight up "
+        "with the event it explains."
+    )
+    x: float = Field(ge=0, le=100, description="Where the moment happened.")
+    y: float = Field(ge=0, le=100, description="Where the moment happened.")
+    player_name: str = Field(
+        description="Human-readable name of the protagonist, for the overlay."
+    )
+    headline: str = Field(description="A short label, e.g. 'Chance -- J. Smith'.")
+    reasons: list[InsightReason] = Field(min_length=1)
+
+    @computed_field
+    @property
+    def evidence_event_ids(self) -> list[str]:
+        """The flat, de-duplicated set of every event any reason cites.
+
+        Derived rather than stored, so the flat list can never drift out of step
+        with the per-reason citations: there is one source of truth, and this is
+        a view of it.
+        """
+        seen: list[str] = []
+        for reason in self.reasons:
+            for event_id in reason.event_ids:
+                if event_id not in seen:
+                    seen.append(event_id)
+        return seen
+
+
+# --------------------------------------------------------------------------- #
+# The Render stage -- the timed overlay feed the graphics layer consumes
+# --------------------------------------------------------------------------- #
+
+
+class OverlayKind(StrEnum):
+    """What a timed overlay payload carries."""
+
+    KEY_MOMENT = "key_moment"        # one cited `Insight`, held for its `ttl_s`
+    MATCH_SUMMARY = "match_summary"  # the full-time card, held until dismissed
+
+
+class OverlayPayload(BaseModel):
+    """One timed graphic a broadcast overlay engine would draw.
+
+    The overlay feed *is* the product. This webapp is only its first renderer:
+    the architecture puts Touchline upstream of the graphics layer, so a real
+    broadcast system consumes exactly these payloads and nothing else changes.
+    Keeping the payload self-describing -- when to show it, how long to hold it,
+    where to anchor it, and the events it cites -- is what makes that swap
+    possible.
+
+    A `MATCH_SUMMARY` payload has `ttl_s == 0`, meaning "hold until dismissed";
+    every other payload holds for `ttl_s` match-seconds.
+    """
+
+    payload_id: str
+    match_id: str
+    kind: OverlayKind
+    clock_s: int = Field(ge=0, description="When the graphic appears.")
+    ttl_s: int = Field(ge=0, description="How long it holds (0 = until dismissed).")
+    insight: Insight | None = Field(
+        default=None, description="Set when kind is KEY_MOMENT."
+    )
+    summary: MatchSummary | None = Field(
+        default=None, description="Set when kind is MATCH_SUMMARY."
+    )

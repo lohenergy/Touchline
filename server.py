@@ -16,10 +16,11 @@ keeps the dependency graph a tree instead of a knot.
 
 WHAT IT STREAMS
 ---------------
-Five kinds of frame ride the one long-lived connection:
+Six kinds of frame ride the one long-lived connection:
 
     meta     -- match identity, once, at the start
     event    -- the raw observable event stream (the Ingest layer)
+    overlay  -- a timed key-moment payload, whenever the Explain stage finds one
     state    -- a periodic MatchState, rebuilt from observables by metrics.py
     summary  -- the full-time MatchSummary, just before the stream closes
     done     -- terminal marker
@@ -29,11 +30,16 @@ speed, replay -- belongs to the client, which buffers the events and advances a
 playhead at the viewer's chosen pace. That is why there is no server-side
 `speed` any more: pacing moved to the one place that can see the controls.
 
-Still absent: the explainer, the narrator, the overlay graphics. Those finish
-Phase 1. The discipline already holds, though: every frame is built from
-observables, and latent ground truth never crosses the boundary -- the event
-stream physically cannot carry it, and metrics.py never imports the simulator
-to reach it.
+The page is no longer computing key moments itself. It used to: a little
+`keyMoment()` heuristic lived in the browser, deciding what counted as a chance.
+Now `explainer.py` decides, on the server, with cited evidence, and ships the
+answer as an `overlay` payload. The client renders that verdict instead of
+guessing at it -- which is the whole point of moving the intelligence upstream of
+the graphics.
+
+Still absent: the narrator. The discipline already holds, though: every frame is
+built from observables, and latent ground truth never crosses the boundary --
+`explainer.py`, like `metrics.py`, cannot import the simulator.
 
 WHAT IS NEW HERE (the things worth learning)
 --------------------------------------------
@@ -63,7 +69,8 @@ from collections.abc import AsyncIterator
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-from metrics import MatchMetrics
+from explainer import MatchExplainer
+from overlay import payload_for
 from simulator import DEMO_AWAY, DEMO_HOME, MatchSimulator
 
 # The application object. `uvicorn server:app` means "import `server`, take the
@@ -109,16 +116,17 @@ async def _stream_match(seed: int) -> AsyncIterator[str]:
     the server. The one price is that "live" here means "a deterministic replay
     at 1x if you want it" -- see the playback engine in the page below.
 
-    Three layers ride the one connection: the raw `event` stream, a periodic
-    `state` (the Interpret stage, updated incrementally), and a final `summary`.
-    The `MatchMetrics` instance is fed exactly the events we send -- the same
-    bytes the browser receives -- so it can only ever know what the viewer knows.
+    Four layers ride the one connection: the raw `event` stream, an `overlay`
+    (the Explain stage's cited key moments), a periodic `state` (Interpret,
+    updated incrementally), and a final `summary`. The `MatchExplainer` instance
+    wraps a `MatchMetrics` and is fed exactly the events we send -- the same bytes
+    the browser receives -- so it can only ever know what the viewer knows.
     """
     sim = MatchSimulator(DEMO_HOME, DEMO_AWAY, match_id=f"LIVE-{seed}", seed=seed)
     sim.simulate(live=True)  # adds kickoff / half-time / full-time markers
     home_id, away_id = sim.home.team_id, sim.away.team_id
 
-    metrics = MatchMetrics(
+    explainer = MatchExplainer(
         sim.match_id,
         home_id,
         away_id,
@@ -145,18 +153,25 @@ async def _stream_match(seed: int) -> AsyncIterator[str]:
         # Only the OBSERVABLE stream is sent. The latent ground truth (control,
         # chaos, pass intent, big-chance/error labels) never crosses this
         # boundary -- enforced by the fact that `observable_stream()` cannot
-        # yield it, and `metrics.py` never imports the simulator to reach it.
-        metrics.update(event)
+        # yield it, and neither `metrics.py` nor `explainer.py` imports the
+        # simulator to reach it.
+        insight = explainer.update(event)
         yield _sse("event", event.model_dump_json())
 
+        # A key moment, explained with citations, as a timed overlay payload. The
+        # client buffers these with the events and shows each one when its own
+        # playhead reaches it, so the overlay stays in step with playback.
+        if insight is not None:
+            yield _sse("overlay", payload_for(insight).model_dump_json())
+
         if (i + 1) % STATE_EVERY_N_EVENTS == 0:
-            yield _sse("state", metrics.state().model_dump_json())
+            yield _sse("state", explainer.state().model_dump_json())
         if not ht_emitted and event.type.value == "half_time":
-            yield _sse("htsummary", metrics.summary().model_dump_json())
+            yield _sse("htsummary", explainer.summary().model_dump_json())
             ht_emitted = True
 
     # Full time: the aggregate the summary screen renders.
-    yield _sse("summary", metrics.summary().model_dump_json())
+    yield _sse("summary", explainer.summary().model_dump_json())
     yield _sse(
         "done",
         json.dumps(
@@ -208,8 +223,9 @@ async def events(
 # graduate to real templates / static assets.
 #
 # Four surfaces, top to bottom, exactly as designed: the pitch (an action map
-# with switchable lenses), the live numbers, the event ticker, and -- revealed
-# at the whistle rather than browsed -- the full-time summary, which is the
+# with switchable lenses), the live numbers, the event ticker -- whose key moments
+# now arrive pre-explained, with the events each claim cites -- and, revealed
+# at the whistle rather than browsed, the full-time summary, which is the
 # metrics engine given a face.
 INDEX_HTML = """<!doctype html>
 <html lang="en">
@@ -311,6 +327,15 @@ INDEX_HTML = """<!doctype html>
     .out { color: var(--mut); }
     .extra { color: #b7a3ff; }
     .empty { color: #56636f; padding: 1rem .4rem; border-left: 0; }
+    /* The cited "why" under a key moment. Every clause here is checkable against
+       an event on the pitch -- that is the difference between an explanation and
+       a caption. */
+    li.keyrow { grid-template-columns: 1fr; gap: 0; }
+    li.keyrow .row { display: grid; grid-template-columns: 4rem 9rem 4rem 1fr auto;
+                     gap: .75rem; }
+    .why { color: #8ea2b5; font-size: .76rem; padding: .15rem 0 .1rem 4.75rem;
+           white-space: normal; }
+    .why b { color: #cbd5e1; font-weight: 600; }
 
     /* The full-time reveal: a broadcast-app stat screen, kept off the live view
        until the whistle so it never competes with the action. */
@@ -381,7 +406,7 @@ INDEX_HTML = """<!doctype html>
     <div class="pitchhint" id="pitchhint"></div>
     <div class="legend">
       <span class="lg"><i class="sw poss"></i>possession change</span>
-      <span class="lg"><i class="sw chance"></i>chance · in box or xG ≥ 0.15</span>
+      <span class="lg"><i class="sw chance"></i>chance · xG ≥ 0.35</span>
       <span class="lg"><i class="sw giveaway"></i>deep giveaway</span>
       <span class="lg"><i class="sw ball"></i>shot · dashed line to target</span>
       <span class="lg">pass thickness: short / medium / long</span>
@@ -436,6 +461,7 @@ INDEX_HTML = """<!doctype html>
   // pause / speed / replay work with no server cooperation.
   const events = [];         // every event received, in order
   const stateFrames = [];    // { at, data } -- `at` = events.length on arrival
+  const overlayByAnchor = {}; // anchor_event_id -> the server's key-moment payload
   let playhead = 0;          // how many events have been drawn
   let playClock = 0;         // match-seconds drawn so far
   let stateCursor = 0;       // next unapplied state frame
@@ -449,12 +475,16 @@ INDEX_HTML = """<!doctype html>
 
   const SPEEDS = [8, 15, 30, 60, 120, 300];
   const AUTO_PAUSE_MS = 1800;   // linger on a goal / chance so the eye can land
-  const CHANCE_XG = 0.15;       // a "chance" = shot in the box, or xG at least this
-  const OWN_THIRD = 100 / 3;    // defensive-third boundary in normalised units
 
+  // The match a visitor lands on. It was picked to exercise the most of the
+  // surface at once: both teams score, it is a real comeback (3–0 down at the
+  // break to 3–3), and it contains every key-moment kind -- goals, big chances
+  // and deep give-aways -- plus woodwork, a red card and a busy keeper. The
+  // other curated matches sit in the picker; this one is the front door.
+  const DEFAULT_SEED = 81;
   const CURATED = [
-    ["Thriller · 4–5", 148],
     ["Comeback · 3–3 from 3 down", 81],
+    ["Thriller · 4–5", 148],
     ["Goalfest · 6–3", 217],
     ["Eight-goal draw · 4–4", 365],
     ["Goalless · 0–0", 25],
@@ -569,9 +599,8 @@ INDEX_HTML = """<!doctype html>
   };
   let currentLens = "action";
 
-  // ---- key moments (observable only) ----------------------------------- //
+  // ---- key moments (decided on the server, not here) -------------------- //
   const POSS_MARKERS = new Set(["pass", "shot"]);
-  const inOwnThird = (e) => (e.team === HOME ? e.x <= OWN_THIRD : e.x >= 100 - OWN_THIRD);
   // The simulator marks every turnover with its own `possession_change` event,
   // so we do not have to *infer* one -- we delimit possession sequences on that
   // event, and call it a genuine *change* only when the team actually differs
@@ -585,14 +614,11 @@ INDEX_HTML = """<!doctype html>
     if (POSS_MARKERS.has(e.type)) lastPossTeam = e.team;
     return { newSeq: false, changed: false };
   }
-  // NOTE: no "big chance" and no "error" here -- both are latent ground truth.
-  // A chance is a *shot in the box or with real xG*; a giveaway is an
-  // *incomplete pass in your own third*. Both are things a viewer can see.
-  function keyMoment(e) {
-    if (e.type === "shot" && (e.in_box === true || (e.shot_quality || 0) >= CHANCE_XG)) return "chance";
-    if (e.type === "pass" && e.outcome === "incomplete" && inOwnThird(e)) return "giveaway";
-    return null;
-  }
+  // There used to be a `keyMoment()` heuristic here, guessing from xG and pitch
+  // position what counted as a chance. It is gone on purpose. `explainer.py`
+  // decides key moments on the server now, and ships each verdict as an
+  // `overlay` payload with the events it cites. This page renders that verdict;
+  // it does not second-guess it. One definition, one place.
 
   // ---- pitch construction ---------------------------------------------- //
   function drawPitch() {
@@ -692,29 +718,52 @@ INDEX_HTML = """<!doctype html>
   }
 
   // ---- ticker + live strip --------------------------------------------- //
-  function addRow(e, km, poss) {
+  // The row shows what happened; for a key moment it also shows *why*, taken
+  // straight from the server's cited reasons. No clause appears here that is not
+  // traceable to an event the viewer can already see.
+  function addRow(e, payload, poss) {
     const empty = feed.querySelector(".empty");
     if (empty) empty.remove();
     const li = document.createElement("li");
-    if (e.type === "shot" && e.outcome === "goal") li.className = "goal";
-    else if (km === "chance") li.className = "chance";
-    else if (km === "giveaway") li.className = "giveaway";
+
+    const kind = payload ? payload.insight.kind : null;
+    if (kind === "goal" || (e.type === "shot" && e.outcome === "goal")) li.className = "goal";
+    else if (kind === "chance") li.className = "chance";
+    else if (kind === "deep_giveaway") li.className = "giveaway";
     else if (poss) li.className = "poss";
 
     let extra = "";
     if (e.shot_quality != null) extra = "xG " + e.shot_quality.toFixed(2);
     else if (e.in_box === true) extra = "in box";
 
-    li.innerHTML =
+    const row =
       '<span class="t">' + clock(e) + "'</span>" +
       '<span class="type">' + e.type + "</span>" +
       '<span class="team">' + e.team + "</span>" +
       '<span class="out">' + e.player_name + " · " + e.outcome + "</span>" +
       '<span class="extra">' + extra + "</span>";
 
+    if (payload) {
+      li.className += " keyrow";
+      li.innerHTML = '<div class="row">' + row + "</div>" + whyHtml(payload.insight);
+    } else {
+      li.innerHTML = row;
+    }
+
     feed.prepend(li);
     // Newest first, so the latest event is always in view without scrolling.
     while (feed.children.length > MAX_ROWS) feed.removeChild(feed.lastChild);
+  }
+
+  // The cited reasons, as one line. Each `reason` from the server already carries
+  // the event ids it is true because of; we show the sentences and keep the ids
+  // in the tooltip, so a curious viewer can audit the claim without reading raw
+  // JSON.
+  function whyHtml(insight) {
+    const parts = insight.reasons.map((r) =>
+      '<span title="' + r.event_ids.join(", ") + '">' + r.text + "</span>"
+    );
+    return '<div class="why">' + parts.join(" ") + "</div>";
   }
 
   function updatePossSplitVisibility() {
@@ -748,8 +797,11 @@ INDEX_HTML = """<!doctype html>
     const seq = sequenceEvent(e);
     if (seq.newSeq) flushActive();
 
-    const km = keyMoment(e);
-    addRow(e, km, seq.changed);
+    // The server's verdict on this event, if it is a key moment. This page does
+    // not decide -- it renders. The payload was buffered with the events, so a
+    // moment lights up when the playhead *reaches* it, not when it arrived.
+    const payload = overlayByAnchor[e.event_id] || null;
+    addRow(e, payload, seq.changed);
     drawMark(e);
     moveActor(e);
 
@@ -783,7 +835,8 @@ INDEX_HTML = """<!doctype html>
       pauseUntil = Number.POSITIVE_INFINITY;
       return true;
     }
-    return (e.type === "shot" && e.outcome === "goal") || km === "chance";
+    return (e.type === "shot" && e.outcome === "goal") ||
+      (payload !== null && payload.insight.kind === "chance");
   }
 
   function advance(ts) {
@@ -851,6 +904,7 @@ INDEX_HTML = """<!doctype html>
     };
     opt("random", "Random match");
     for (const [name, s] of CURATED) opt(String(s), name + " · seed " + s);
+    sel.value = String(DEFAULT_SEED);   // show the match actually on screen
   }
 
   el("replay").onclick = () => resetPlayback();
@@ -895,7 +949,7 @@ INDEX_HTML = """<!doctype html>
     el("chips").innerHTML = "";
     if (homePct) homePct.textContent = "";
     if (awayPct) awayPct.textContent = "";
-    htSummaryShown = false; pausedForHt = false; htData = null;
+    htSummaryShown = false; pausedForHt = false;
     el("summary").classList.add("hidden");
   }
 
@@ -903,7 +957,12 @@ INDEX_HTML = """<!doctype html>
     if (es) es.close();
     events.length = 0;
     stateFrames.length = 0;
+    for (const k in overlayByAnchor) delete overlayByAnchor[k];
     summaryData = null; doneFlag = false;
+    // A new match invalidates the buffered halves. Replay must *keep* them --
+    // the EventSource is already closed by then, so there is nothing to re-fetch
+    // them from, and clearing them left the half-time card empty on replay.
+    htData = null;
     HOME = null; AWAY = null;
     matchup.textContent = "connecting…";
     setStatus("connecting…", false);
@@ -921,6 +980,13 @@ INDEX_HTML = """<!doctype html>
       setStatus("streaming " + m.events + " events", true);
     });
     es.addEventListener("event", (msg) => { events.push(JSON.parse(msg.data)); });
+    es.addEventListener("overlay", (msg) => {
+      // The Explain stage's verdict, buffered by the event it is anchored on.
+      // Like the state frames, it is applied when the playhead reaches that
+      // point, not when it arrives.
+      const p = JSON.parse(msg.data);
+      overlayByAnchor[p.insight.anchor_event_id] = p;
+    });
     es.addEventListener("state", (msg) => {
       // Pair the frame with how many events had arrived, so playback can apply
       // it at the right point in the timeline rather than on arrival.
@@ -1035,7 +1101,7 @@ INDEX_HTML = """<!doctype html>
   buildSpeeds();
   buildSeeds();
   updatePlayBtn();
-  connect(148);                 // the thriller leads; the seed picker offers more
+  connect(DEFAULT_SEED);        // the comeback leads; the seed picker offers more
   requestAnimationFrame(frame);
 </script>
 </body>

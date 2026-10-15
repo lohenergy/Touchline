@@ -56,21 +56,28 @@ The pipeline follows the brief's five stages:
 |---|---|---|
 | **Ingest** | Synthetic events stream in real time | `simulator.py` |
 | **Interpret** | Events → `MatchState` (control, chaos, tempo, shot quality) | `metrics.py` *(Phase 1)* |
-| **Explain** | Detect key moments, attribute *why* using cited evidence | `explainer.py` *(Phase 1)* |
-| **Render** | Timed overlay payloads consumed by a graphics layer | `overlay.py` *(Phase 1)* |
+| **Explain** | Detect key moments, attribute *why* using cited evidence | `explainer.py` *(Phase 2)* |
+| **Render** | Timed overlay payloads consumed by a graphics layer | `overlay.py` *(Phase 2)* |
 | **Personalize** | Narrative and Depth audience modes (plus languages) from one intelligence layer | *(Phase 2)* |
 
 ## Repository layout
 
 ```
-schemas.py      Domain contracts: MatchEvent, LatentState, MatchState, MatchSummary
-                (+ pass types, stoppage ledger, contested possession, save/block/
-                woodwork events, in-box geometry, big-chance/error truth)
+schemas.py      Domain contracts: MatchEvent, LatentState, MatchState, MatchSummary,
+                Insight, OverlayPayload (+ pass types, stoppage ledger, contested
+                possession, save/block/woodwork events, in-box geometry,
+                big-chance/error truth)
 simulator.py    Synthetic match generator (observable events + latent ground truth)
 metrics.py      Interpret stage: observable events -> MatchState / MatchSummary
+explainer.py    Explain stage: key moments + cited reasons, scored against truth
+overlay.py      Render stage: insights -> timed overlay payloads
+pass_classifier.py  Phase-2 classifier: pass intent from geometry alone
 validate.py     Calibration harness: does the synthetic data look like football?
 test_events.py  Invariant tests: is the event stream semantically correct?
 test_metrics.py Tests: can the match be rebuilt from observables alone?
+test_pass_classifier.py  Does intent recovery actually work?
+test_explainer.py        Are the cited claims real, past, and honest?
+test_overlay.py          Does every moment render exactly once, in order?
 server.py       Web surface: FastAPI + SSE console (pitch, live strip, ticker,
                 full-time summary) — one long-lived stream, no build step
 ```
@@ -116,16 +123,75 @@ share of unstructured events — and Phase 2 learns better estimators and scores
 them against `control_true` / `chaos_true`. A weak, *measured* baseline is worth
 more than a confident, unfalsifiable one.
 
+## The Explain stage: claims you can check, and one you cannot
+
+`explainer.py` picks out the key moments and says *why* each one mattered, with
+every reason citing the `event_id`s it is true because of. It wraps `MatchMetrics`
+and reads only observable events — like `metrics.py`, it cannot import the
+simulator, so it has no code path to the truth. A moment is a structure, not a
+sentence: "Chance — J. Smith, struck from 12 m (xG 0.41), built from a 14 m pass
+by A. Cole" is three clauses, each bound to events a viewer already saw.
+
+The reasons are **tagged by kind**, and that is a correctness decision, not
+cosmetics. The scoring harness selects a claim by `reason.kind == CREATOR`, never
+by matching English, so rewording a sentence can never silently break the audit.
+
+Because the data is synthetic, every claim can be *graded*. `explainer.py` scores
+its own explanations on a held-out block of 40 matches:
+
+| claim | precision | recall | F1 | base rate |
+|---|---|---|---|---|
+| "we called it a chance" | 0.96 | 0.92 | **0.94** | 0.080 |
+| "we credited the right pass" | 1.00 | 0.95 | 0.97 | 0.849 |
+| "a give-away was a real error" | 0.04 | 1.00 | 0.07 | **0.036** |
+
+The chance result is the real one: an observable xG bar recovers a latent label
+almost exactly. The creator result is a *conformance* check — the attribution rule
+mirrors the simulator's own book-keeping, and across 79 big chances it names the
+identical pass 75 times and a *different* pass zero times.
+
+The third row is the interesting one, and it changed the design. It reads
+"precision 0.04", which sounds like a broken detector until you compare it to the
+base rate: **0.04 against a base rate of 0.036**. When precision sits at the base
+rate, the flag carries *no information* — knowing a deep give-away happened tells
+you essentially nothing about whether it was a genuine error, because only ~4% of
+them are, and the tape offers nothing to separate those from the rest.
+
+So the tempting third claim — "this chance came from that give-away" — was
+**removed**. It reads beautifully and it would have been wrong nineteen times in
+twenty. The give-away still appears, as its own observable moment; it is never
+asserted as the *cause* of a later one. This is the discipline the project exists
+to demonstrate: with real data, nobody could have checked that sentence, and it
+would have shipped.
+
+## The Render stage: the feed *is* the product
+
+`overlay.py` turns insights into a timed overlay timeline — show this card at
+this match-second, hold it this long, anchor it here, cite these events. It is
+deliberately the dumbest stage: it decides *when* and *how long*, never *what is
+true*. Every word it emits was produced and cited upstream, so an overlay bug can
+invent nothing; the worst it can do is show a real claim at the wrong moment,
+which is a timing bug and easy to see.
+
+The architecture puts Touchline *upstream* of the graphics layer, so the payload
+is renderer-agnostic by construction: a kind, a start time, a duration, an anchor,
+and the cited events. Our web page is simply its first consumer, and a broadcast
+graphics box would be the next, with nothing else changing. Hold times are a
+broadcast judgement, not a derived quantity — a goal earns longer on screen than a
+give-away, because the eye needs longer to take in "4–5" than "they lost it 30 m
+out" — so they live as three named constants you can argue with.
+
 ## The web surface: one stream, four surfaces
 
 `server.py` is the *composition root* — the one place where the pieces are
 assembled behind HTTP (a Telegram bot's `main.py`, with routes instead of
-handlers). It serves one page and one long-lived SSE stream, and emits five
+handlers). It serves one page and one long-lived SSE stream, and emits six
 kinds of frame:
 
 ```
 meta     match identity, once, at the start
 event    the raw observable event stream (the Ingest layer)
+overlay  a timed key-moment payload from the Explain stage, with citations
 state    a periodic MatchState, rebuilt by metrics.py
 summary  the full-time MatchSummary, just before the stream closes
 done     terminal marker
@@ -133,7 +199,11 @@ done     terminal marker
 
 The page renders three live surfaces — the pitch, the live numbers, and the event
 ticker — plus a fourth that is *revealed* rather than browsed: the full-time
-summary, which is the metrics engine given a face.
+summary, which is the metrics engine given a face. Key moments in the ticker now
+arrive **pre-explained**: the server sends the claim and the events it cites, and
+the page renders that verdict instead of guessing at it. The old client-side
+`keyMoment()` heuristic is gone — one definition of "a chance", in one place,
+upstream of the graphics.
 
 **The client owns the clock.** The server streams the match as fast as it can
 produce it; the page buffers the events and advances a *playhead* at a speed the
@@ -172,12 +242,19 @@ shot endpoint is decided in the simulator, so it was fixed there, where the
 outcome is known — the renderer only draws what it is given.
 
 **Key moments are observable only.** The legend names three: a possession change
-(yellow), a *chance* — a shot in the box or with xG above a threshold (green),
-and a *deep giveaway* — an incomplete pass in the passer's own third (red). The
-simulator's latent "big chance" and "error leading to a chance" tiers never
-appear here; they exist to be scored in Phase 2, and putting them on the analyst
-surface would be exactly the leakage the project forbids. What the viewer sees is
-what a viewer could see.
+(yellow), a *chance* — a shot with xG of at least 0.35 (green), and a *deep
+giveaway* — an incomplete pass in the passer's own third (red). The simulator's
+latent "big chance" and "error leading to a chance" tiers never appear here; they
+exist to be scored, and putting them on the analyst surface would be exactly the
+leakage the project forbids. What the viewer sees is what a viewer could see.
+
+The chance threshold is not a stylistic choice. It was selected on a disjoint
+tuning block as the xG bar that best recovers the simulator's latent
+`big_chance_true` label, and it earns its keep: on a held-out block it separates
+big chances at **F1 0.94** against an 8% base rate. The earlier rule — "in the box
+*or* xG ≥ 0.15" — was replaced because every big chance is already in the box, so
+the box term added hundreds of harmless pot-shots and cost ~60 points of
+precision for no recall. xG already encodes the geometry.
 
 **The live strip is two-sided wherever the stat is.** Possession is a *share*, so
 the strip reads `poss 55% – 45%` — a lone "55%" would read as if one team owned
@@ -188,9 +265,9 @@ observables, so it belongs on the analyst surface. The ticker lists events
 **newest first**, so the latest action is always in view without scrolling.
 
 One connection carries everything, and every frame is built from observables.
-The `MatchMetrics` instance in the server is fed exactly the events it sends —
-the same bytes the browser receives — so the interpretation can only ever know
-what the viewer knows.
+The `MatchExplainer` in the server — which wraps `MatchMetrics` — is fed exactly
+the events it sends, the same bytes the browser receives, so the interpretation
+can only ever know what the viewer knows.
 
 ## Running it
 
@@ -201,9 +278,15 @@ pip install -r requirements.txt
 
 python simulator.py        # generate one match and print a summary
 python metrics.py          # interpret one match; print the full-time summary
+python explainer.py        # score the explanations, then show one match's key moments
+python overlay.py          # print one match's timed overlay timeline
+python pass_classifier.py  # recover pass intent from geometry; print the scores
 python validate.py 120     # calibration report over 120 matches
 python test_events.py      # invariant tests on the event stream
 python test_metrics.py     # tests: the match rebuilt from observables alone
+python test_pass_classifier.py   # tests: intent recovered, no truth leaked
+python test_explainer.py   # tests: cited claims are real, past and honest
+python test_overlay.py     # tests: every moment renders once, in order
 
 python -m uvicorn server:app --reload   # the console, at http://127.0.0.1:8000
 ```
@@ -268,9 +351,9 @@ with a straight face.
 If `control_true` ever appeared on a `MatchEvent`, predicting it would be
 reading the answer off the input.
 
-## Three mechanisms that make the simulation honest
+## Four mechanisms that make the simulation honest
 
-Three choices in the simulator exist purely so the *explainers* built on top can
+Four choices in the simulator exist purely so the *explainers* built on top can
 be grounded rather than decorative.
 
 **1. Added time is explained, not announced.** Each half accumulates a stoppage
@@ -290,7 +373,7 @@ the moment the broadcast story peaks.
 
 **3. Pass intent is ground truth.** `_choose_pass` decides *why* a ball is
 played — short, long, through, cross — and that intent rides only in the latent
-channel. Phase 1 builds a geometric classifier that must recover it from
+channel. Phase 2 builds a geometric classifier that must recover it from
 `x/y/end_x/end_y` alone and scores itself against the label. It is a miniature
 of the whole project: the machine must infer intent from observable traces, and
 we get to measure how well it does — with real data you never could.
@@ -376,7 +459,8 @@ Phase 0 complete, and Phase 0.6 (the stat bundle) with it:
   the clock. `control` and `chaos` ship as transparent baselines, to be learned
   and scored against `control_true` / `chaos_true` in Phase 2.
 - **Phase 1 (web surface)**: `server.py` streams one SSE connection carrying
-  `meta` / `event` / `state` / `summary` / `done`. The page renders the event
+  `meta` / `event` / `state` / `summary` / `done` (Phase 2 adds the `overlay`
+  frame). The page renders the event
   ticker, a live numbers strip from periodic `state` frames, and — revealed at
   full time — the `summary`, which is the metrics engine given a face.
 - **Phase 1 (pitch renderer)**: the action map, drawn to scale, with four
@@ -397,9 +481,52 @@ Phase 0 complete, and Phase 0.6 (the stat bundle) with it:
   the full-time card gained a substitutions row; replay now clears the live
   numbers rather than briefly showing the previous run's. Presentation only — no
   new quantity reaches the analyst surface.
+- **Phase 2 (pass-intent classifier)**: `pass_classifier.py` recovers pass intent
+  (short / long / through / cross) from the pass geometry alone. The
+  attacking-local frame is rebuilt from the event's `team` and the home id, and
+  four thresholds were selected on a disjoint tuning block *before* scoring. On a
+  held-out block of 40 matches it reaches **91.0%** (95% CI 90.7–91.3) against a
+  64.8% majority baseline; per-class F1 is 0.93 short, 1.00 long, 0.82 through,
+  0.73 cross. `test_pass_classifier.py` asserts the module cannot import the
+  simulator (no truth channel) and that every class is genuinely recovered. The
+  residual error is explainable rather than hidden: near the byline the
+  simulator's own endpoint clamp erases the direction of travel, and a cross is
+  genuinely hard to separate from wide progression.
+- **Phase 2 (explainer)**: `explainer.py` is the Explain stage. It recognises the
+  observable key moments (goal, chance, deep give-away) and attributes *why*, with
+  every reason citing the `event_id`s it is true because of — shot origin and xG,
+  and the completed pass that built it. The citations are not decoration:
+  `test_explainer.py` walks every citation across 15 matches and asserts it names a
+  real event that does not postdate the moment, so a claim can always be audited
+  against the tape. It wraps `MatchMetrics`, so the server drives Interpret and
+  Explain from one event feed.
+- **Phase 2 (explainer scoring)**: because the data is synthetic, the explainer
+  *grades its own explanations*. On a held-out block of 40 matches the chance model
+  recovers the latent big-chance label at **F1 0.94** against an 8% base rate, and
+  the creator attribution names the identical pass as the simulator on 75 of 79 big
+  chances and a different one zero times. The third candidate claim — that a chance
+  came from a give-away — was *measured and removed*: at precision 0.04 against a
+  0.036 base rate the flag carries no information, so it would have been wrong
+  nineteen times in twenty and is never asserted. Instead the give-away is surfaced
+  as its own observable moment, never as the cause of a later one, and
+  `ReasonKind` has no `CAUSE` member.
+- **Phase 2 (overlay)**: `overlay.py` turns insights into a timed overlay feed —
+  start time, hold time, anchor, cited events — sorted in clock order, with a
+  full-time summary payload that holds until dismissed. `test_overlay.py` pins the
+  contract a graphics layer depends on: every insight renders exactly once, at its
+  own clock, and the summary is last.
+- **Phase 2 (wired into the web surface)**: `server.py` now emits an `overlay`
+  frame per key moment alongside the event stream, and the page renders the
+  server's cited reasons in the ticker (hover a clause to see the events it cites).
+  The client-side `keyMoment()` heuristic was deleted — one definition of "a
+  chance", upstream of the graphics, is the whole architectural point. A
+  pre-existing bug was found and fixed in the process: on **replay** the half-time
+  card rendered empty, because `resetPlayback` discarded the buffered half that the
+  closed `EventSource` could no longer re-send. It is now cleared on a *new match*
+  and kept on replay, like the full-time summary.
 
-Next — the geometric pass classifier scored against `pass_type_true`, then the
-explainer (`explainer.py`) and overlay payloads (`overlay.py`).
+Next — score `control` / `chaos` against `control_true` / `chaos_true`, then the
+Narrator (one LLM call at full time, `LocalNarrator` fallback first).
 
 All clubs, players and matches are fictional. No real football data, trademarks
 or match footage are used.
