@@ -594,3 +594,102 @@ class OverlayPayload(BaseModel):
     summary: MatchSummary | None = Field(
         default=None, description="Set when kind is MATCH_SUMMARY."
     )
+
+
+# --------------------------------------------------------------------------- #
+# The Narrator stage -- grounded studio-desk commentary
+# --------------------------------------------------------------------------- #
+# This is the one stage allowed to call a language model, and the schemas here
+# are the *fence* around it. A model asked to "write about the match" will
+# happily invent a stat, a minute or a name, because fluency and accuracy are
+# independent skills. So the model is never asked to be careful: it is asked to
+# return this shape, and every claim it makes must carry the ids of the
+# observable events the sentence is true because of. The prose is the model's;
+# the evidence is not, and a claim whose evidence does not check out is thrown
+# away rather than trusted. See `narrator.py` for the three gates.
+#
+# `provider` and `model` travel with the narrative for the same reason the
+# calibration harness prints its reference ranges: a reader should always be
+# able to see which claims a model made and which came from the deterministic
+# fallback, instead of a confident paragraph of unknown provenance.
+
+
+class Reveal(StrEnum):
+    """Which moment of the match a narrative belongs to.
+
+    Both are *scheduled*: half-time and full-time are fixed points on the clock,
+    so a narrative can never be requested mid-flow and can never chain into
+    another request. Two reveals per match is the whole budget.
+    """
+
+    HALF_TIME = "ht"
+    FULL_TIME = "ft"
+
+
+class PersonaId(StrEnum):
+    """The three chairs at the virtual studio desk.
+
+    They exist to give one set of facts three voices, not three sets of facts.
+    A partisan reading and a numbers reading of the same event are both useful
+    to a viewer precisely because they disagree about *emphasis* while agreeing
+    about what happened. If a persona could introduce a fact the others could
+    not, it would be a liability rather than a feature.
+    """
+
+    ANALYST = "analyst"   # measured, tactical, explains the "why"
+    DIEHARD = "diehard"   # partisan foil: emotional, but still cited
+    NUMBERS = "numbers"   # xG purist: only what it can point a number at
+
+
+class NarrativeClaim(BaseModel):
+    """One sentence of commentary and the events that make it true.
+
+    `event_ids` may be empty, and that is a deliberate, honest signal: it marks
+    a claim grounded in the summary as a whole ("they finished with more xG")
+    rather than in a single moment. Such a claim still passes the number audit
+    (every figure in it must appear in the facts it was given), it simply has no
+    single playhead position to seek to. A renderer shows "Show me" only when
+    this list is non-empty -- the user is never offered a jump that would land
+    on nothing.
+    """
+
+    text: str = Field(min_length=1, description="One short, human sentence.")
+    event_ids: list[str] = Field(
+        default_factory=list,
+        description="Observable events this sentence is true because of. Empty "
+        "means 'grounded in the summary as a whole', not 'ungrounded'.",
+    )
+
+
+class PersonaTake(BaseModel):
+    """One pundit's reading of a reveal: a headline and a few cited claims."""
+
+    persona: PersonaId
+    headline: str = Field(min_length=1)
+    claims: list[NarrativeClaim] = Field(min_length=1)
+
+
+class RevealNarrative(BaseModel):
+    """The studio desk's response at one scheduled reveal.
+
+    `validated` is False whenever any persona had to be backfilled from the
+    deterministic fallback -- usually because the model's JSON did not parse, a
+    citation did not resolve, or a number could not be found in the facts. The
+    panel renders either way; the flag travels so a viewer (and the project's
+    own honesty standard) can tell model prose from template prose at a glance.
+    """
+
+    narrative_id: str
+    match_id: str
+    reveal: Reveal
+    clock_s: int = Field(ge=0, description="When the desk is speaking.")
+    personas: list[PersonaTake] = Field(min_length=1)
+    provider: str = Field(description="azure | github | local")
+    model: str
+    validated: bool = Field(
+        description="True only if every persona came from the model and passed "
+        "every gate."
+    )
+    dropped_claims: int = Field(
+        default=0, ge=0, description="Claims discarded by the citation or number gate."
+    )

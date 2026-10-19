@@ -16,14 +16,16 @@ keeps the dependency graph a tree instead of a knot.
 
 WHAT IT STREAMS
 ---------------
-Six kinds of frame ride the one long-lived connection:
+Eight kinds of frame ride the one long-lived connection:
 
-    meta     -- match identity, once, at the start
-    event    -- the raw observable event stream (the Ingest layer)
-    overlay  -- a timed key-moment payload, whenever the Explain stage finds one
-    state    -- a periodic MatchState, rebuilt from observables by metrics.py
-    summary  -- the full-time MatchSummary, just before the stream closes
-    done     -- terminal marker
+    meta       -- match identity, once, at the start
+    event      -- the raw observable event stream (the Ingest layer)
+    overlay    -- a timed key-moment payload, whenever the Explain stage finds one
+    state      -- a periodic MatchState, rebuilt from observables by metrics.py
+    htsummary  -- the half-time MatchSummary, at the half_time marker
+    summary    -- the full-time MatchSummary, just before the stream closes
+    narrative  -- the studio desk's cited reading, at each reveal (twice: HT, FT)
+    done       -- terminal marker
 
 The server streams these as fast as it can produce them. *Playback* -- pause,
 speed, replay -- belongs to the client, which buffers the events and advances a
@@ -37,9 +39,13 @@ answer as an `overlay` payload. The client renders that verdict instead of
 guessing at it -- which is the whole point of moving the intelligence upstream of
 the graphics.
 
-Still absent: the narrator. The discipline already holds, though: every frame is
-built from observables, and latent ground truth never crosses the boundary --
-`explainer.py`, like `metrics.py`, cannot import the simulator.
+The `narrative` frame is the one place a language model is used, and it is
+deliberately last: it consumes the finished, cited `MatchSummary` and `Insight`
+objects. It cannot fail the stream -- a timeout or a missing key falls back to the
+deterministic narrator (`narrator.py`), because the demo must never depend on a
+network. Latent ground truth never crosses this boundary: `explainer.py`, like
+`metrics.py`, cannot import the simulator, and the narrator is handed only what
+they expose.
 
 WHAT IS NEW HERE (the things worth learning)
 --------------------------------------------
@@ -70,7 +76,9 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from explainer import MatchExplainer
+from narrator import Narrator, build_context, narrator_from_env
 from overlay import payload_for
+from schemas import Reveal
 from simulator import DEMO_AWAY, DEMO_HOME, MatchSimulator
 
 # The application object. `uvicorn server:app` means "import `server`, take the
@@ -104,6 +112,43 @@ def _sse(event: str, data: str) -> str:
 # each frame with the number of events it had received, so it can replay the
 # numbers in sync with playback instead of on arrival.
 STATE_EVERY_N_EVENTS = 40
+
+
+# The Narrator is built once per process from the environment. It is the only
+# stage that may touch the network, and it fails soft: a missing key, a dead
+# endpoint or a timeout all fall back to the deterministic narrator, so the
+# stream below always completes.
+_NARRATOR: Narrator | None = None
+
+
+def _narrator() -> Narrator:
+    global _NARRATOR
+    if _NARRATOR is None:
+        _NARRATOR = narrator_from_env()
+    return _NARRATOR
+
+
+async def _narrative_frame(
+    match_id: str, reveal: Reveal, clock_s: int, explainer: MatchExplainer
+) -> str | None:
+    """Ask the desk for one reveal and frame it for the wire.
+
+    Wrapped so that *nothing* the narrator does can abort the stream: a dropped
+    connection to the model must cost the viewer commentary, never the match. On
+    a total failure we return None and the client simply keeps the previous
+    panel -- no half-built frame is ever sent.
+    """
+    try:
+        narrative = await _narrator().narrate(
+            build_context(
+                match_id, reveal, clock_s, explainer.summary(), explainer.insights()
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 -- last line of defence around the LLM
+        print(f"[server] narrator failed ({type(exc).__name__}: {exc}); "
+              "omitting the narrative frame")
+        return None
+    return _sse("narrative", narrative.model_dump_json())
 
 
 async def _stream_match(seed: int) -> AsyncIterator[str]:
@@ -149,12 +194,14 @@ async def _stream_match(seed: int) -> AsyncIterator[str]:
     )
 
     ht_emitted = False
+    last_clock = 0
     for i, event in enumerate(sim.observable_stream()):
         # Only the OBSERVABLE stream is sent. The latent ground truth (control,
         # chaos, pass intent, big-chance/error labels) never crosses this
         # boundary -- enforced by the fact that `observable_stream()` cannot
         # yield it, and neither `metrics.py` nor `explainer.py` imports the
         # simulator to reach it.
+        last_clock = event.clock_s
         insight = explainer.update(event)
         yield _sse("event", event.model_dump_json())
 
@@ -168,10 +215,21 @@ async def _stream_match(seed: int) -> AsyncIterator[str]:
             yield _sse("state", explainer.state().model_dump_json())
         if not ht_emitted and event.type.value == "half_time":
             yield _sse("htsummary", explainer.summary().model_dump_json())
+            # The desk speaks at the break, over the half-time card.
+            frame = await _narrative_frame(
+                sim.match_id, Reveal.HALF_TIME, event.clock_s, explainer
+            )
+            if frame:
+                yield frame
             ht_emitted = True
 
-    # Full time: the aggregate the summary screen renders.
+    # Full time: the aggregate the summary screen renders, then the desk's verdict.
     yield _sse("summary", explainer.summary().model_dump_json())
+    frame = await _narrative_frame(
+        sim.match_id, Reveal.FULL_TIME, last_clock, explainer
+    )
+    if frame:
+        yield frame
     yield _sse(
         "done",
         json.dumps(
@@ -364,6 +422,49 @@ INDEX_HTML = """<!doctype html>
     .ft-foot { margin-top: 1rem; padding-top: .7rem; border-top: 1px solid var(--line);
                color: var(--mut); font-size: .8rem; text-align: center; }
     .ft-dismiss { margin-top: .5rem; color: #56636f; font-size: .72rem; text-align: center; }
+
+    /* The studio desk: three pundits reading the SAME facts in three voices.
+       Every claim shows the events it is true because of, and a claim anchored on
+       a real moment offers "Show me" -- which closes the card and drops the
+       playhead onto that event. The desk is where the grounded language model
+       speaks, so its provenance (which model, or the deterministic fallback) is
+       printed rather than hidden. */
+    .desk { margin-top: 1rem; padding-top: .8rem; border-top: 1px solid var(--line); }
+    .desk-head { display: flex; align-items: baseline; gap: .55rem; margin-bottom: .55rem; }
+    .desk-head b { font-size: .74rem; letter-spacing: .14em; text-transform: uppercase;
+                   color: #cbd5e1; }
+    .prov { font-size: .7rem; color: #56636f; margin-left: auto; }
+    .prov.model { color: #9fd0ff; }
+    .desk-typing { color: #56636f; font-size: .8rem; font-style: italic; padding: .3rem 0; }
+    .pundit { border-left: 3px solid #2b3a4a; padding: .4rem .65rem .5rem; margin-bottom: .5rem;
+              background: #0b1119; border-radius: 0 6px 6px 0; }
+    .pundit.analyst { border-left-color: #9fd0ff; }
+    .pundit.diehard { border-left-color: var(--chance); }
+    .pundit.numbers { border-left-color: #b7a3ff; }
+    .pundit-head { display: flex; gap: .5rem; align-items: baseline; flex-wrap: wrap; }
+    .pname { font-size: .68rem; letter-spacing: .12em; text-transform: uppercase;
+             color: var(--mut); }
+    .pline { font-weight: 600; font-size: .86rem; }
+    .pundit ul { list-style: none; margin: .35rem 0 0; padding: 0; }
+    .pundit li { display: block; white-space: normal; border: 0; border-bottom: 0;
+                 padding: .2rem 0; color: #c9d4df; font-size: .82rem; line-height: 1.35; }
+    .pundit li.clickable { cursor: pointer; }
+    .showme { font: inherit; font-size: .68rem; margin-left: .45rem; padding: .07rem .5rem;
+              color: #0b0f14; background: #9fd0ff; border: 0; border-radius: 999px;
+              cursor: pointer; opacity: 0; transition: opacity .12s; white-space: nowrap; }
+    .pundit li.clickable:hover .showme, .pundit li.open .showme { opacity: 1; }
+    .ev { display: none; margin: .3rem 0 .1rem; padding: .35rem .55rem;
+          background: #0f151d; border: 1px solid #1d2836; border-radius: 6px; }
+    .pundit li.open .ev { display: block; }
+    .evrow { font-size: .72rem; color: #8ea2b5; padding: .05rem 0; }
+    .evrow b { color: #9fd0ff; }
+    .evteam { color: #c9d4df; }
+    .judge { font-size: .68rem; color: #56636f; margin-top: .3rem; white-space: normal; }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(159, 208, 255, .55); }
+      100% { box-shadow: 0 0 0 16px rgba(159, 208, 255, 0); }
+    }
+    .pulse { animation: pulse .85s ease-out 2; border-radius: 8px; }
   </style>
 </head>
 <body>
@@ -426,6 +527,7 @@ INDEX_HTML = """<!doctype html>
         <div class="ft-sub" id="ft-sub">Full time</div>
       </div>
       <div id="ft-rows"></div>
+      <div id="desk" class="desk"></div>
       <div class="ft-foot" id="ft-foot"></div>
       <div class="ft-dismiss">click outside the card to return to the pitch</div>
     </div>
@@ -452,6 +554,12 @@ INDEX_HTML = """<!doctype html>
 
   // ---- identity, filled from the `meta` frame -------------------------- //
   let HOME = null, AWAY = null, score = {};
+  // Team *names*, for the desk's evidence drawer. A claim says "Northbridge's
+  // giveaways" and cites events; showing each cited event's team is what lets a
+  // reader see for themselves whether the sentence and the tape agree.
+  let HOME_NAME = null, AWAY_NAME = null;
+  const teamName = (id) =>
+    id === HOME ? (HOME_NAME || "home") : id === AWAY ? (AWAY_NAME || "away") : id;
   const TEAM_COLOR = {};
   const setColors = () => { TEAM_COLOR[HOME] = "#3b82f6"; TEAM_COLOR[AWAY] = "#f59e0b"; };
 
@@ -470,6 +578,8 @@ INDEX_HTML = """<!doctype html>
   let lastTs = null;         // null until the first animation frame
   let pauseUntil = 0;        // auto-pause deadline, ms
   let summaryData = null, htData = null, doneFlag = false, summaryShown = false, htSummaryShown = false, pausedForHt = false;
+  let htNarrative = null, ftNarrative = null;   // the desk's reading at each reveal
+  let currentReveal = null;                     // "ht" | "ft" -- which card is open
   let lastPossTeam = null;   // for detecting possession-change moments
   let es = null;
 
@@ -492,6 +602,12 @@ INDEX_HTML = """<!doctype html>
   ];
 
   const clock = (e) => e.minute + (e.stoppage_minute ? "+" + e.stoppage_minute : "");
+  // Model prose is untrusted text: it lands in the DOM via innerHTML, so it is
+  // escaped on the way in. The gates on the server decide what is *true*; this
+  // only decides what is *inert*.
+  const esc = (s) => String(s).replace(/[&<>"]/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const PERSONA_LABEL = { analyst: "The Analyst", diehard: "The Diehard", numbers: "The Numbers" };
   function setStatus(text, up) {
     status.textContent = text;
     status.className = up ? "up" : "down";
@@ -766,6 +882,129 @@ INDEX_HTML = """<!doctype html>
     return '<div class="why">' + parts.join(" ") + "</div>";
   }
 
+  // ---- the studio desk -------------------------------------------------- //
+  // Server-side, every claim has already been checked: its citations resolve to
+  // real events and every number in it appears in the facts the desk was given.
+  // The page's job is only to render that, and to let a viewer audit it -- open
+  // the evidence inline, or jump the playhead onto the moment a claim cites.
+  function eventById(id) {
+    for (let i = 0; i < events.length; i++) if (events[i].event_id === id) return events[i];
+    return null;
+  }
+
+  function evidenceHtml(ids) {
+    return ids.map((id) => {
+      const e = eventById(id);
+      const body = e
+        ? "<b>" + clock(e) + "'</b> " + '<span class="evteam">' +
+          esc(teamName(e.team)) + "</span> " + esc(e.player_name) + " · " +
+          esc(e.type) + " · " + esc(e.outcome)
+        : esc(id) + " (not in this stream)";
+      return '<div class="evrow">' + body + "</div>";
+    }).join("");
+  }
+
+  function renderDesk(narrative) {
+    const box = el("desk");
+    if (!box) return;
+    if (!narrative) {
+      box.innerHTML = '<div class="desk-head"><b>The desk</b></div>' +
+        '<div class="desk-typing">the desk is still typing…</div>';
+      return;
+    }
+    const provenance = narrative.validated
+      ? '<span class="prov model">live desk · ' + esc(narrative.model) +
+        (narrative.dropped_claims ? " · " + narrative.dropped_claims + " claim(s) cut" : "") + "</span>"
+      : '<span class="prov">deterministic desk · ' + esc(narrative.model) + "</span>";
+
+    const parts = ['<div class="desk-head"><b>The desk</b>' + provenance + "</div>"];
+    for (const take of narrative.personas) {
+      parts.push('<div class="pundit ' + take.persona + '">');
+      parts.push('<div class="pundit-head"><span class="pname">' +
+        (PERSONA_LABEL[take.persona] || take.persona) + '</span><span class="pline">' +
+        esc(take.headline) + "</span></div><ul>");
+      for (const claim of take.claims) {
+        const anchored = claim.event_ids.length > 0;
+        parts.push('<li class="claim' + (anchored ? " clickable" : "") + '"' +
+          (anchored ? ' data-anchor="' + esc(claim.event_ids[0]) + '"' : "") + ">");
+        parts.push("<span>" + esc(claim.text) + "</span>");
+        if (anchored) {
+          parts.push('<button class="showme" type="button">Show me</button>');
+          parts.push('<div class="ev">' + evidenceHtml(claim.event_ids) + "</div>");
+        }
+        parts.push("</li>");
+      }
+      parts.push("</ul></div>");
+    }
+    parts.push('<div class="judge">Hover a claim for the events behind it, ' +
+      "or press “Show me” to jump the pitch to that moment.</div>");
+    box.innerHTML = parts.join("");
+
+    // Wire the interactions after the HTML is in the DOM. Clicking the row opens
+    // the evidence drawer; the button seeks to the claim's first cited event.
+    box.querySelectorAll("li.claim.clickable").forEach((li) => {
+      const btn = li.querySelector(".showme");
+      li.addEventListener("click", (e) => {
+        if (e.target === btn) return;          // the button seeks, it does not toggle
+        li.classList.toggle("open");
+      });
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        seekToEvent(li.dataset.anchor);
+      });
+    });
+  }
+
+  function pulsePitch() {
+    const node = el("pitch");
+    node.classList.remove("pulse");
+    void node.offsetWidth;                     // restart the animation
+    node.classList.add("pulse");
+    setTimeout(() => node.classList.remove("pulse"), 1900);
+  }
+
+  // Jump the playhead onto a cited moment by replaying the buffer silently up to
+  // it. The buffer is already in memory, so this is instant, and replaying (rather
+  // than teleporting) is what keeps the pitch an honest record: every mark and
+  // row up to that point is redrawn exactly as it would have been live.
+  function seekToEvent(eventId) {
+    if (!eventId) return;
+    const idx = events.findIndex((e) => e.event_id === eventId);
+    if (idx < 0) return;
+
+    el("summary").classList.add("hidden");
+    currentReveal = null;
+    pausedForHt = false;      // drop any half-time hold; we are taking over playback
+
+    playhead = 0; playClock = 0; stateCursor = 0; lastTs = null; pauseUntil = 0;
+    summaryShown = false; htSummaryShown = true;   // suppress the HT pause en route
+    marksLayer.replaceChildren();
+    activeLayer.replaceChildren();
+    feed.innerHTML = '<li class="empty">jumping…</li>';
+    score = {}; if (HOME) { score[HOME] = 0; score[AWAY] = 0; }
+    scoreEl.textContent = "0 – 0";
+    el("chips").innerHTML = "";
+
+    for (let i = 0; i <= idx && i < events.length; i++) {
+      drawEvent(events[i]);
+      playhead = i + 1;
+    }
+    while (stateCursor < stateFrames.length && stateFrames[stateCursor].at <= playhead) {
+      paintState(stateFrames[stateCursor].data);
+      stateCursor++;
+    }
+
+    htSummaryShown = false;
+    // Stop just *before* the moment so the next press of play shows it.
+    const target = events[Math.min(idx, events.length - 1)];
+    playClock = Math.max(0, target.clock_s - 0.5);
+    playing = false; updatePlayBtn();
+    pauseUntil = Number.POSITIVE_INFINITY;
+    clockEl.textContent = clock(target) + "'";
+    setStatus("paused on a cited moment", true);
+    pulsePitch();
+  }
+
   function updatePossSplitVisibility() {
     const inPoss = currentLens === "Possession";
     const opacity = inPoss ? "0.12" : "0";
@@ -913,6 +1152,7 @@ INDEX_HTML = """<!doctype html>
   el("summary").onclick = (ev) => {
     if (ev.target === el("summary")) {
       el("summary").classList.add("hidden");
+      currentReveal = null;
       if (pausedForHt) {
         pausedForHt = false;
         playing = true;
@@ -950,6 +1190,7 @@ INDEX_HTML = """<!doctype html>
     if (homePct) homePct.textContent = "";
     if (awayPct) awayPct.textContent = "";
     htSummaryShown = false; pausedForHt = false;
+    currentReveal = null;
     el("summary").classList.add("hidden");
   }
 
@@ -963,6 +1204,7 @@ INDEX_HTML = """<!doctype html>
     // the EventSource is already closed by then, so there is nothing to re-fetch
     // them from, and clearing them left the half-time card empty on replay.
     htData = null;
+    htNarrative = null; ftNarrative = null; currentReveal = null;
     HOME = null; AWAY = null;
     matchup.textContent = "connecting…";
     setStatus("connecting…", false);
@@ -973,6 +1215,7 @@ INDEX_HTML = """<!doctype html>
     es.addEventListener("meta", (msg) => {
       const m = JSON.parse(msg.data);
       HOME = m.home_id; AWAY = m.away_id;
+      HOME_NAME = m.home; AWAY_NAME = m.away;
       score = {}; score[HOME] = 0; score[AWAY] = 0;
       setColors();
       matchup.textContent = m.home + " vs " + m.away + " · seed " + seed;
@@ -994,6 +1237,19 @@ INDEX_HTML = """<!doctype html>
     });
     es.addEventListener("htsummary", (msg) => { htData = JSON.parse(msg.data); });
     es.addEventListener("summary", (msg) => { summaryData = JSON.parse(msg.data); });
+    es.addEventListener("narrative", (msg) => {
+      // The desk's reading. It may arrive after the card that shows it (the
+      // server generates it while the client is paused at the break), so store it
+      // and re-render if the matching card is already on screen.
+      const n = JSON.parse(msg.data);
+      if (n.reveal === "ht") {
+        htNarrative = n;
+        if (currentReveal === "ht") renderDesk(n);
+      } else {
+        ftNarrative = n;
+        if (currentReveal === "ft") renderDesk(n);
+      }
+    });
     es.addEventListener("done", () => { doneFlag = true; if (es) es.close(); });
     es.onerror = () => setStatus("reconnecting…", false);
   }
@@ -1043,6 +1299,8 @@ INDEX_HTML = """<!doctype html>
     if (at["1"] != null) foot += " · added time " + mmss(at["1"]) + " + " + mmss(at["2"] || 0);
     el("ft-foot").textContent = foot;
     el("ft-sub").textContent = "Half time";
+    currentReveal = "ht";
+    renderDesk(htNarrative);
   }
 
   function renderSummary(s) {
@@ -1092,6 +1350,8 @@ INDEX_HTML = """<!doctype html>
     if (at["1"] != null) foot += " · added time " + mmss(at["1"]) + " + " + mmss(at["2"] || 0);
     el("ft-foot").textContent = foot;
     el("ft-sub").textContent = "Full time";
+    currentReveal = "ft";
+    renderDesk(ftNarrative);
   }
 
   // ---- boot ------------------------------------------------------------- //
