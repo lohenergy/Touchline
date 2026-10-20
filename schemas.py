@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 
 # --------------------------------------------------------------------------- #
@@ -641,8 +641,50 @@ class PersonaId(StrEnum):
     NUMBERS = "numbers"   # xG purist: only what it can point a number at
 
 
+class Verdict(StrEnum):
+    """A critic's ruling on one claim.
+
+    Three outcomes, and the middle one is the reason this exists. A model that
+    invents an event is caught by the citation gate, and a model that invents a
+    figure is caught by the number gate -- but a model that describes a *real*
+    event accurately while pinning it on the wrong team passes both. Only a
+    reader who checks the claim against its own evidence catches that.
+    """
+
+    SUPPORTED = "supported"           # the evidence shows what the claim says
+    MISATTRIBUTED = "misattributed"   # it happened -- to somebody else
+    UNSUPPORTED = "unsupported"       # the evidence does not show it at all
+
+
+class ClaimVerdict(BaseModel):
+    """A ruling on one claim, addressed by id rather than by its English.
+
+    `claim_id` is the whole address. A ruling is matched to a sentence by
+    position, never by comparing text: two claims can read identically, a claim
+    can be reworded and stay the same claim, and a critic that decides which
+    sentence it is talking about by string comparison is one paraphrase away from
+    ruling on the wrong one.
+
+    `contradicts` is the fact the critic is overriding the claim with, quoted from
+    the evidence. It is required whenever the verdict is not `SUPPORTED`, and a
+    ruling that fails to produce one is discarded rather than shown -- which is
+    what keeps a self-contradicting ruling ("unsupported, because the facts
+    confirm it") off the screen.
+    """
+
+    claim_id: int = Field(ge=0, description="The claim's position in the roster.")
+    persona: PersonaId
+    verdict: Verdict
+    reason: str = Field(description="One sentence, in the critic's own words.")
+    contradicts: str = Field(
+        default="",
+        description="The evidence the claim gets wrong, quoted. Empty for a "
+        "supported claim.",
+    )
+
+
 class NarrativeClaim(BaseModel):
-    """One sentence of commentary and the events that make it true.
+    """One sentence of commentary, the events that make it true, and any ruling.
 
     `event_ids` may be empty, and that is a deliberate, honest signal: it marks
     a claim grounded in the summary as a whole ("they finished with more xG")
@@ -651,13 +693,32 @@ class NarrativeClaim(BaseModel):
     single playhead position to seek to. A renderer shows "Show me" only when
     this list is non-empty -- the user is never offered a jump that would land
     on nothing.
+
+    `ruling` is the critic's verdict, attached to the sentence it judged rather
+    than filed somewhere else. When it says anything other than `SUPPORTED`, the
+    claim has already survived: the desk still said it, and hiding that would
+    hide the disagreement, which is the most interesting thing on the panel. The
+    renderer shows the claim, the ruling and the fact the critic cited beside
+    each other and lets a reader decide. Neither the system nor the critic gets
+    the last word; the evidence is on screen for both of them.
     """
 
+    claim_id: int = Field(
+        default=0,
+        ge=0,
+        description="Position in the reveal's roster. Assigned by "
+        "`RevealNarrative` from the order the claims are written in, so it "
+        "cannot disagree with that order; producers do not set it.",
+    )
     text: str = Field(min_length=1, description="One short, human sentence.")
     event_ids: list[str] = Field(
         default_factory=list,
         description="Observable events this sentence is true because of. Empty "
         "means 'grounded in the summary as a whole', not 'ungrounded'.",
+    )
+    ruling: ClaimVerdict | None = Field(
+        default=None,
+        description="The critic's ruling, or None if the claim went unreviewed.",
     )
 
 
@@ -677,6 +738,19 @@ class RevealNarrative(BaseModel):
     citation did not resolve, or a number could not be found in the facts. The
     panel renders either way; the flag travels so a viewer (and the project's
     own honesty standard) can tell model prose from template prose at a glance.
+
+    `verified` answers a different question and is deliberately not folded into
+    `validated`. `validated` is about the *prose*: did the configured model write
+    it, and did it survive the gates. `verified` is about the *review*: did a
+    model read the claims back and rule on every one of them. A reveal can be
+    validated and unverified -- a good model wrote it and nobody checked it -- and
+    a viewer deserves to be able to tell those two apart.
+
+    Note what is *not* here: a list of removed claims. The critic has no delete
+    key. Every claim the desk wrote reaches the viewer, with its ruling attached,
+    because the only honest way to publish a fallible critic is to publish its
+    disagreements where they can be read against the claim they are about.
+    `disputed_claims` counts them for the summary line; `personas` carries them.
     """
 
     narrative_id: str
@@ -693,3 +767,37 @@ class RevealNarrative(BaseModel):
     dropped_claims: int = Field(
         default=0, ge=0, description="Claims discarded by the citation or number gate."
     )
+    verifier: str = Field(
+        default="none",
+        description="Who ruled on the claims: local | azure | github | none.",
+    )
+    verified: bool = Field(
+        default=False,
+        description="True only if the model critic adjudicated every claim. "
+        "False for the attribution-only critic, which does not read prose.",
+    )
+    disputed_claims: int = Field(
+        default=0,
+        ge=0,
+        description="Claims the critic ruled against. They are still on the "
+        "desk: a ruling is a disagreement, not a deletion.",
+    )
+
+    @model_validator(mode="after")
+    def _number_claims(self) -> RevealNarrative:
+        """Stamp every claim with its position, once, here.
+
+        The id has to have exactly one author. If the desk numbered its own
+        claims, two producers could number the same reveal differently, and a
+        ruling addressed to claim 4 would land on whatever the reader believed
+        claim 4 was. Deriving it from the structure means the number *is* the
+        position -- the critic addresses a claim by where it sits, the verdict is
+        attached by that number, the client draws it in that slot, and no stage
+        ever has to compare English to find out which sentence is meant.
+        """
+        position = 0
+        for take in self.personas:
+            for claim in take.claims:
+                claim.claim_id = position
+                position += 1
+        return self

@@ -44,17 +44,16 @@ import httpx
 import narrator as narr
 from narrator import (
     ChatCompletionsNarrator,
-    HttpPlan,
     LocalNarrator,
     SYSTEM_PROMPT,
     _number_forms,
-    _strip_fences,
     allowed_numbers,
     build_context,
     build_user_prompt,
     citable_event_ids,
     local_narrative,
 )
+from llm import HttpPlan, strip_fences
 from schemas import PersonaId, Reveal
 
 LATENT_KEYS = (
@@ -90,7 +89,8 @@ def plan() -> HttpPlan:
 
 
 def scripted(reply_text: str, status: int = 200,
-             recorder: list | None = None) -> ChatCompletionsNarrator:
+             recorder: list | None = None,
+             temperature: float = 0.3) -> ChatCompletionsNarrator:
     """A real narrator whose socket is a script that returns `reply_text`."""
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -100,7 +100,9 @@ def scripted(reply_text: str, status: int = 200,
             status, json={"choices": [{"message": {"content": reply_text}}]}
         )
 
-    return ChatCompletionsNarrator(plan(), transport=httpx.MockTransport(handler))
+    return ChatCompletionsNarrator(
+        plan(), temperature=temperature, transport=httpx.MockTransport(handler)
+    )
 
 
 def reply(analyst: list, diehard: list, numbers: list) -> str:
@@ -446,7 +448,7 @@ def test_fenced_json_is_accepted() -> None:
     )
     out = asyncio.run(scripted(f"```json\n{body}\n```").narrate(ctx))
     assert out.validated is True
-    assert _strip_fences(f"```json\n{body}\n```").startswith("{")
+    assert strip_fences(f"```json\n{body}\n```").startswith("{")
 
 
 def test_http_error_falls_back_to_local() -> None:
@@ -493,86 +495,16 @@ def test_local_narrator_is_deterministic() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_azure_plan_uses_v1_path_when_no_api_version() -> None:
-    saved = {k: os.environ.get(k) for k in
-             ("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY",
-              "AZURE_OPENAI_DEPLOYMENT", "AZURE_OPENAI_API_VERSION")}
-    try:
-        os.environ.update(
-            AZURE_OPENAI_ENDPOINT="https://example.openai.azure.com/",
-            AZURE_OPENAI_API_KEY="k",
-            AZURE_OPENAI_DEPLOYMENT="gpt-narrator",
-            AZURE_OPENAI_API_VERSION="",
-        )
-        p = narr._azure_plan()
-        assert p.url == "https://example.openai.azure.com/openai/v1/chat/completions"
-        assert p.headers["api-key"] == "k"
-        assert p.body_model == "gpt-narrator"
-
-        os.environ["AZURE_OPENAI_API_VERSION"] = "2025-01-01-preview"
-        p2 = narr._azure_plan()
-        assert p2.url == (
-            "https://example.openai.azure.com/openai/deployments/gpt-narrator"
-            "/chat/completions?api-version=2025-01-01-preview"
-        )
-    finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-
-def test_normalize_endpoint_strips_a_pasted_operation_path() -> None:
-    cases = {
-        # The exact bug: the Foundry portal copies the full operation URL.
-        "https://res.services.ai.azure.com/openai/v1/responses": "https://res.services.ai.azure.com",
-        "https://res.services.ai.azure.com/openai/v1/": "https://res.services.ai.azure.com",
-        "https://res.services.ai.azure.com/openai/v1/chat/completions": "https://res.services.ai.azure.com",
-        # A Foundry *project* endpoint is a different path on the same host.
-        "https://res.services.ai.azure.com/api/projects/myproj": "https://res.services.ai.azure.com",
-        # Already-clean forms are left alone, trailing slash and all.
-        "https://res.services.ai.azure.com": "https://res.services.ai.azure.com",
-        "https://res.services.ai.azure.com/": "https://res.services.ai.azure.com",
-        # The host may legitimately contain ".openai." -- that is a domain, not
-        # a path, and must survive untouched.
-        "https://football-predictor.openai.azure.com/": "https://football-predictor.openai.azure.com",
-        "https://football-predictor.openai.azure.com/openai/deployments/d/chat/completions":
-            "https://football-predictor.openai.azure.com",
-    }
-    for raw, want in cases.items():
-        assert narr._normalize_endpoint(raw) == want, raw
-
-
-def test_azure_plan_survives_the_pasted_full_url() -> None:
-    saved = {k: os.environ.get(k) for k in
-             ("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY",
-              "AZURE_OPENAI_DEPLOYMENT", "AZURE_OPENAI_API_VERSION")}
-    try:
-        os.environ.update(
-            AZURE_OPENAI_ENDPOINT="https://res.services.ai.azure.com/openai/v1/responses",
-            AZURE_OPENAI_API_KEY="k",
-            AZURE_OPENAI_DEPLOYMENT="gpt-narrator",
-            AZURE_OPENAI_API_VERSION="",
-        )
-        p = narr._azure_plan()
-        assert p.url == "https://res.services.ai.azure.com/openai/v1/chat/completions"
-    finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-
 def test_temperature_is_low_by_default_and_configurable() -> None:
-    ctx = ft_context(81)
-    default = ChatCompletionsNarrator(plan())
-    assert default._payload(ctx, True)["temperature"] == 0.3
-    hot = ChatCompletionsNarrator(plan(), temperature=0.9)
-    assert hot._payload(ctx, True)["temperature"] == 0.9
-    asyncio.run(default.aclose())
-    asyncio.run(hot.aclose())
+    """A report on fixed facts should not be a different report each run."""
+    sent: list = []
+    asyncio.run(scripted("not json", recorder=sent).narrate(ft_context(81)))
+    assert json.loads(sent[0].content)["temperature"] == 0.3
+
+    sent.clear()
+    hot = scripted("not json", recorder=sent, temperature=0.9)
+    asyncio.run(hot.narrate(ft_context(81)))
+    assert json.loads(sent[0].content)["temperature"] == 0.9
 
 
 def test_from_env_reads_temperature_and_builds_an_azure_plan() -> None:

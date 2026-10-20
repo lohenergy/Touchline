@@ -24,8 +24,9 @@ Eight kinds of frame ride the one long-lived connection:
     state      -- a periodic MatchState, rebuilt from observables by metrics.py
     htsummary  -- the half-time MatchSummary, at the half_time marker
     summary    -- the full-time MatchSummary, just before the stream closes
-    narrative  -- the studio desk's cited reading, at each reveal (twice: HT, FT)
-    done       -- terminal marker
+    narrative  -- the studio desk's cited reading, at each reveal (twice: HT, FT),
+                  checked by the critic before it leaves the server
+    done       -- terminal marker, carrying the run's agent trace
 
 The server streams these as fast as it can produce them. *Playback* -- pause,
 speed, replay -- belongs to the client, which buffers the events and advances a
@@ -70,16 +71,29 @@ Then open http://127.0.0.1:8000/
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from typing import Any
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 
+from agents import (
+    DESK,
+    EXPLAIN,
+    GENERATE,
+    INTERPRET,
+    RENDER,
+    VERIFY,
+    AgentSpec,
+    Blackboard,
+    ContractError,
+)
 from explainer import MatchExplainer
 from narrator import Narrator, build_context, narrator_from_env
 from overlay import payload_for
 from schemas import Reveal
 from simulator import DEMO_AWAY, DEMO_HOME, MatchSimulator
+from verifier import VerificationContext, Verifier, Review, apply_verdicts, verifier_from_env
 
 # The application object. `uvicorn server:app` means "import `server`, take the
 # attribute named `app`, and serve it." This single line is the composition root.
@@ -120,6 +134,10 @@ STATE_EVERY_N_EVENTS = 40
 # stream below always completes.
 _NARRATOR: Narrator | None = None
 
+# Same contract, same lazy singleton, for the critic. `LocalVerifier` is the
+# offline answer: it checks what a rule can check and says so in its own name.
+_VERIFIER: Verifier | None = None
+
 
 def _narrator() -> Narrator:
     global _NARRATOR
@@ -128,27 +146,131 @@ def _narrator() -> Narrator:
     return _NARRATOR
 
 
-async def _narrative_frame(
-    match_id: str, reveal: Reveal, clock_s: int, explainer: MatchExplainer
-) -> str | None:
-    """Ask the desk for one reveal and frame it for the wire.
+def _verifier() -> Verifier:
+    global _VERIFIER
+    if _VERIFIER is None:
+        _VERIFIER = verifier_from_env()
+    return _VERIFIER
 
-    Wrapped so that *nothing* the narrator does can abort the stream: a dropped
-    connection to the model must cost the viewer commentary, never the match. On
-    a total failure we return None and the client simply keeps the previous
-    panel -- no half-built frame is ever sent.
+
+async def _narrative_frame(
+    board: Blackboard, match_id: str, reveal: Reveal, clock_s: int
+) -> str | None:
+    """Ask the desk for one reveal, have it checked, and frame the result.
+
+    Two agents run here and they meet only through the board. The desk is handed a
+    *view* -- its declared reads and nothing else -- so there is no latent key for
+    it to reach for, even by accident. Its draft is committed under the desk's
+    contract, and the critic is then handed a view of that draft plus the same
+    evidence, so the review reads what the desk actually wrote rather than a copy
+    passed alongside it.
+
+    The rest is failure recovery, and the two failures are different sizes. A dead
+    model costs the commentary: the desk run is marked FAILED, this returns None,
+    and the client keeps the previous panel -- no half-built frame is ever sent. A
+    dead *critic* costs only the review: the draft still reaches the viewer, and
+    the narrative records that it went unchecked rather than implying otherwise.
     """
-    try:
-        narrative = await _narrator().narrate(
-            build_context(
-                match_id, reveal, clock_s, explainer.summary(), explainer.insights()
-            )
+    view = board.view(DESK)
+    summaries = view.get("summary")
+    if not summaries:
+        board.trace.fail(
+            DESK, ContractError("asked to speak before Interpret produced a summary")
         )
+        return None
+    ctx = build_context(
+        match_id, reveal, clock_s, summaries[-1], view.get("insight", [])
+    )
+    desk = _narrator()
+    try:
+        with board.trace.session(DESK) as desk_run:
+            draft = await desk.narrate(ctx)
+            desk_run.tick()
+            desk_run.note(f"provider={draft.provider} model={draft.model}")
+            if desk.provider == "local":
+                # Not a fallback: the deterministic desk was the configured path.
+                desk_run.note("deterministic desk, as configured")
+            elif draft.provider != desk.provider:
+                desk_run.degrade(
+                    f"{desk.provider} unavailable; fell back to the local desk"
+                )
+            elif not draft.validated:
+                desk_run.degrade("one or more personas backfilled by the local desk")
     except Exception as exc:  # noqa: BLE001 -- last line of defence around the LLM
         print(f"[server] narrator failed ({type(exc).__name__}: {exc}); "
               "omitting the narrative frame")
         return None
-    return _sse("narrative", narrative.model_dump_json())
+    board.put(DESK, "draft", draft)
+
+    review = await _review(board)
+    narrative = apply_verdicts(board.latest("draft"), review)
+    board.put(DESK, "narrative", narrative)
+    return _sse("narrative", board.latest("narrative").model_dump_json())
+
+
+async def _review(board: Blackboard) -> Review:
+    """Run the critic under its own contract, and never let it cost the desk's work.
+
+    Given a failure here the draft stands unreviewed, which is the honest outcome:
+    the claims were not checked, and the narrative says so (`verifier="none"`).
+    """
+    view = board.view(VERIFY)
+    drafts = view.get("draft")
+    summaries = view.get("summary")
+    if not drafts or not summaries:
+        board.trace.fail(VERIFY, ContractError("asked to review before a draft existed"))
+        return Review(provider="none", model="none")
+    critic = _verifier()
+    try:
+        with board.trace.session(VERIFY) as critic_run:
+            review = await critic.review(
+                VerificationContext(
+                    draft=drafts[-1],
+                    summary=summaries[-1],
+                    insights=view.get("insight", []),
+                )
+            )
+            critic_run.tick()
+            critic_run.note(f"provider={review.provider} model={review.model}")
+            if critic.provider == "local":
+                critic_run.note("attribution-only critic, as configured")
+            elif review.fell_back:
+                critic_run.degrade(
+                    f"{critic.provider} unavailable; attribution-only critic stood in"
+                )
+            elif not review.complete:
+                critic_run.degrade("the critic did not rule on every claim")
+            # The count goes in the trace, not into the prose: a review that found
+            # nothing and a review that never happened must not read the same way.
+            critic_run.note(
+                f"{review.disputed} of {len(review.verdicts)} claims disputed"
+                if review.disputed
+                else f"all {len(review.verdicts)} claims stood"
+            )
+    except Exception as exc:  # noqa: BLE001 -- a failed review must not cost the commentary
+        board.trace.fail(VERIFY, exc)
+        print(f"[server] verifier failed ({type(exc).__name__}: {exc}); "
+              "the draft stands unreviewed")
+        return Review(provider="none", model="none")
+    board.put(VERIFY, "verdict", review)
+    return review
+
+
+def _product(board: Blackboard, spec: AgentSpec, fn: Callable[[], Any]) -> Any:
+    """Read one of an agent's products; a broken read costs a frame, not the match.
+
+    Deliberately not timed: Interpret's wall time lives inside the Explainer's,
+    and reporting a number that only covers the moments we happened to sample
+    would be worse than reporting none. `Trace.run` is for agents whose calls can
+    be timed honestly.
+    """
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001 -- an observability product must not kill the stream
+        board.trace.fail(spec, exc)
+        print(f"[server] {spec.name} failed to produce a product "
+              f"({type(exc).__name__}: {exc}); skipping this frame")
+        return None
 
 
 async def _stream_match(seed: int) -> AsyncIterator[str]:
@@ -167,31 +289,38 @@ async def _stream_match(seed: int) -> AsyncIterator[str]:
     wraps a `MatchMetrics` and is fed exactly the events we send -- the same bytes
     the browser receives -- so it can only ever know what the viewer knows.
     """
-    sim = MatchSimulator(DEMO_HOME, DEMO_AWAY, match_id=f"LIVE-{seed}", seed=seed)
-    sim.simulate(live=True)  # adds kickoff / half-time / full-time markers
+    # The one shared state every agent meets at. Nothing latent is ever put on
+    # it: `Blackboard.put` only accepts a key some agent declared as a product,
+    # and no agent declares one.
+    board = Blackboard()
+    with board.trace.session(GENERATE) as gen:
+        sim = MatchSimulator(DEMO_HOME, DEMO_AWAY, match_id=f"LIVE-{seed}", seed=seed)
+        gen.tick()
+        sim.simulate(live=True)  # adds kickoff / half-time / full-time markers
+        gen.tick()
     home_id, away_id = sim.home.team_id, sim.away.team_id
 
+    identity = {
+        "match_id": sim.match_id,
+        "home": sim.home.name,
+        "away": sim.away.name,
+        "home_id": home_id,
+        "away_id": away_id,
+        "events": len(sim.snapshots),
+    }
+    board.put(GENERATE, "match", identity)
+
+    # The Explainer is built from the identity the generator committed, not from
+    # the simulator object -- that is the handoff, and it is the same data.
     explainer = MatchExplainer(
-        sim.match_id,
-        home_id,
-        away_id,
-        home_name=sim.home.name,
-        away_name=sim.away.name,
+        identity["match_id"],
+        identity["home_id"],
+        identity["away_id"],
+        home_name=identity["home"],
+        away_name=identity["away"],
     )
 
-    yield _sse(
-        "meta",
-        json.dumps(
-            {
-                "match_id": sim.match_id,
-                "home": sim.home.name,
-                "away": sim.away.name,
-                "home_id": home_id,
-                "away_id": away_id,
-                "events": len(sim.snapshots),
-            }
-        ),
-    )
+    yield _sse("meta", json.dumps(identity))
 
     ht_emitted = False
     last_clock = 0
@@ -202,31 +331,50 @@ async def _stream_match(seed: int) -> AsyncIterator[str]:
         # yield it, and neither `metrics.py` nor `explainer.py` imports the
         # simulator to reach it.
         last_clock = event.clock_s
-        insight = explainer.update(event)
+        insight = board.trace.run(EXPLAIN, explainer.update, event)
+        board.trace.tick(INTERPRET)  # the Explainer advanced Interpret once
         yield _sse("event", event.model_dump_json())
 
         # A key moment, explained with citations, as a timed overlay payload. The
         # client buffers these with the events and shows each one when its own
         # playhead reaches it, so the overlay stays in step with playback.
         if insight is not None:
-            yield _sse("overlay", payload_for(insight).model_dump_json())
+            # Produced, committed under Explain's contract, then handed to the
+            # renderer *from the board*. The wire is a consumer too: a frame can
+            # only carry a product the producing agent was contracted to make.
+            board.put(EXPLAIN, "insight", insight)
+            payload = board.trace.run(
+                RENDER, payload_for, board.view(RENDER)["insight"][-1], soft=True
+            )
+            if payload is not None:
+                board.put(RENDER, "overlay", payload)
+                yield _sse("overlay", board.latest("overlay").model_dump_json())
 
         if (i + 1) % STATE_EVERY_N_EVENTS == 0:
-            yield _sse("state", explainer.state().model_dump_json())
+            state = _product(board, INTERPRET, explainer.state)
+            if state is not None:
+                board.put(INTERPRET, "state", state)
+                yield _sse("state", board.latest("state").model_dump_json())
         if not ht_emitted and event.type.value == "half_time":
-            yield _sse("htsummary", explainer.summary().model_dump_json())
-            # The desk speaks at the break, over the half-time card.
-            frame = await _narrative_frame(
-                sim.match_id, Reveal.HALF_TIME, event.clock_s, explainer
-            )
-            if frame:
-                yield frame
+            summary = _product(board, INTERPRET, explainer.summary)
+            if summary is not None:
+                board.put(INTERPRET, "summary", summary)
+                yield _sse("htsummary", board.latest("summary").model_dump_json())
+                # The desk speaks at the break, over the half-time card.
+                frame = await _narrative_frame(
+                    board, identity["match_id"], Reveal.HALF_TIME, event.clock_s
+                )
+                if frame:
+                    yield frame
             ht_emitted = True
 
     # Full time: the aggregate the summary screen renders, then the desk's verdict.
-    yield _sse("summary", explainer.summary().model_dump_json())
+    summary = _product(board, INTERPRET, explainer.summary)
+    if summary is not None:
+        board.put(INTERPRET, "summary", summary)
+        yield _sse("summary", board.latest("summary").model_dump_json())
     frame = await _narrative_frame(
-        sim.match_id, Reveal.FULL_TIME, last_clock, explainer
+        board, identity["match_id"], Reveal.FULL_TIME, last_clock
     )
     if frame:
         yield frame
@@ -237,7 +385,10 @@ async def _stream_match(seed: int) -> AsyncIterator[str]:
                 "score": {
                     "home": sim.score[home_id],
                     "away": sim.score[away_id],
-                }
+                },
+                # Who did what, in handoff order. The web page ignores this; the
+                # trace panel and the tests are the two readers that don't.
+                "trace": board.trace.snapshot(),
             }
         ),
     )
@@ -344,6 +495,12 @@ INDEX_HTML = """<!doctype html>
     .spd.active { color: #0b0f14; background: #9fd0ff; border-color: #9fd0ff; font-weight: 600; }
     #seedin { width: 7rem; cursor: text; }
     .grow { flex: 1 1 auto; }
+    /* The preview's way out. While "Show me" replays a cited moment the reveal
+       card is closed, so this button stays on screen for the whole preview as an
+       explicit route back. It is what makes the preview a detour rather than a
+       dead end. */
+    #backtodesk { color: #0b0f14; background: #9fd0ff; border-color: #9fd0ff; font-weight: 600; }
+    #backtodesk:hover { border-color: #9fd0ff; opacity: .88; }
 
     /* The pitch: an honest action map drawn to scale (105m x 68m). Every mark
        is one real event, and nothing is invented between them. */
@@ -488,6 +645,7 @@ INDEX_HTML = """<!doctype html>
   <div id="controls">
     <button id="playpause" class="btn" title="Pause">❚❚</button>
     <span class="speeds" id="speeds"></span>
+    <button id="backtodesk" class="btn hidden" title="Leave the replay and return to the desk">← back to the desk</button>
     <span class="grow"></span>
     <button id="replay" class="btn" title="Replay from the start">⟲</button>
     <select id="seedsel" title="Choose a match"></select>
@@ -582,9 +740,22 @@ INDEX_HTML = """<!doctype html>
   let currentReveal = null;                     // "ht" | "ft" -- which card is open
   let lastPossTeam = null;   // for detecting possession-change moments
   let es = null;
+  // ---- "Show me" preview ------------------------------------------------- //
+  // Pressing "Show me" on a desk claim does not teleport the pitch onto the cited
+  // event; it replays the build-up to that event and then hands the viewer back
+  // to the desk, card and all. The replay is therefore stateful -- it carries a
+  // snapshot to restore to -- which is what stops the jump becoming a one-way
+  // trip with nothing on screen and no way back.
+  let preview = null;          // { targetIdx, dwellUntil, saved } | null
+  let suppressCards = false;   // true mid-rebuild, so no reveal fires on the way through
 
   const SPEEDS = [8, 15, 30, 60, 120, 300];
   const AUTO_PAUSE_MS = 1800;   // linger on a goal / chance so the eye can land
+  const PREVIEW_LEAD_S = 12;    // match-seconds of build-up replayed before the cited moment
+  // The preview runs at its own rate rather than the viewer's, so a moment chosen
+  // at 300x still reads as a build-up instead of a single flashing frame.
+  const PREVIEW_SPEED = 10;     // match-seconds per real second while previewing
+  const PREVIEW_DWELL_MS = 1700;// hold on the cited moment itself before the desk returns
 
   // The match a visitor lands on. It was picked to exercise the most of the
   // surface at once: both teams score, it is a real comeback (3–0 down at the
@@ -963,29 +1134,27 @@ INDEX_HTML = """<!doctype html>
     setTimeout(() => node.classList.remove("pulse"), 1900);
   }
 
-  // Jump the playhead onto a cited moment by replaying the buffer silently up to
-  // it. The buffer is already in memory, so this is instant, and replaying (rather
-  // than teleporting) is what keeps the pitch an honest record: every mark and
-  // row up to that point is redrawn exactly as it would have been live.
-  function seekToEvent(eventId) {
-    if (!eventId) return;
-    const idx = events.findIndex((e) => e.event_id === eventId);
-    if (idx < 0) return;
-
-    el("summary").classList.add("hidden");
-    currentReveal = null;
-    pausedForHt = false;      // drop any half-time hold; we are taking over playback
-
-    playhead = 0; playClock = 0; stateCursor = 0; lastTs = null; pauseUntil = 0;
-    summaryShown = false; htSummaryShown = true;   // suppress the HT pause en route
+  // ---- rebuild, preview, return ----------------------------------------- //
+  // Redraw the pitch from the in-memory buffer up to (not including) index
+  // `upto`. Replaying rather than teleporting is what keeps the pitch an honest
+  // record: every mark, ticker row and score is redrawn exactly as it would have
+  // been live, and nothing is interpolated between them. Returns the playhead it
+  // landed on so the caller can carry on from there.
+  function rebuildTo(upto) {
+    suppressCards = true;
     marksLayer.replaceChildren();
     activeLayer.replaceChildren();
-    feed.innerHTML = '<li class="empty">jumping…</li>';
+    const stop = Math.max(0, Math.min(upto, events.length));
+    feed.innerHTML = stop > 0 ? "" : '<li class="empty">waiting for the first event…</li>';
+    // Live numbers are cleared too, so a rebuild can never show values belonging
+    // to a point further along the match than where the playhead now sits.
+    el("chips").innerHTML = "";
+    el("pos-h").style.width = "50%";
+    el("pos-a").style.width = "50%";
     score = {}; if (HOME) { score[HOME] = 0; score[AWAY] = 0; }
     scoreEl.textContent = "0 – 0";
-    el("chips").innerHTML = "";
-
-    for (let i = 0; i <= idx && i < events.length; i++) {
+    playhead = 0; stateCursor = 0; lastPossTeam = null;
+    for (let i = 0; i < stop; i++) {
       drawEvent(events[i]);
       playhead = i + 1;
     }
@@ -993,16 +1162,79 @@ INDEX_HTML = """<!doctype html>
       paintState(stateFrames[stateCursor].data);
       stateCursor++;
     }
+    suppressCards = preview !== null;   // a preview owns the screen until it ends
+    return playhead;
+  }
 
-    htSummaryShown = false;
-    // Stop just *before* the moment so the next press of play shows it.
-    const target = events[Math.min(idx, events.length - 1)];
-    playClock = Math.max(0, target.clock_s - 0.5);
-    playing = false; updatePlayBtn();
-    pauseUntil = Number.POSITIVE_INFINITY;
-    clockEl.textContent = clock(target) + "'";
-    setStatus("paused on a cited moment", true);
+  // Rewind to just before a cited event and play its build-up through. The
+  // snapshot is taken *before* the jump, so returning restores the exact session
+  // the viewer came from -- at half time that means the held half-time card and
+  // the paused clock, not just "somewhere earlier".
+  function seekToEvent(eventId) {
+    if (!eventId) return;
+    const idx = events.findIndex((e) => e.event_id === eventId);
+    if (idx < 0) return;
+    const target = events[idx];
+
+    preview = {
+      targetIdx: idx,
+      dwellUntil: 0,
+      saved: {
+        playhead, playClock, summaryShown, htSummaryShown, pausedForHt,
+        currentReveal, pauseUntil, playing,
+        revealVisible: !el("summary").classList.contains("hidden"),
+        status: status.textContent,
+        statusUp: status.classList.contains("up"),
+      },
+    };
+
+    el("summary").classList.add("hidden");
+    el("backtodesk").classList.remove("hidden");
+    currentReveal = null;
+    summaryShown = false;   // the preview must not trip the full-time reveal
+    pausedForHt = false;    // and it owns playback while it runs
+
+    // Start far enough back that the moment arrives with a visible build-up.
+    let start = idx;
+    while (start > 0 && events[start - 1].clock_s >= target.clock_s - PREVIEW_LEAD_S) start--;
+    rebuildTo(start);
+
+    playClock = events[start] ? events[start].clock_s : target.clock_s;
+    playing = true; pauseUntil = 0; lastTs = null;
+    updatePlayBtn();
+    clockEl.textContent = start > 0 ? clock(events[start - 1]) + "'" : "0'";
+    setStatus("replaying the build-up", true);
     pulsePitch();
+  }
+
+  // Hand the pitch back to exactly where the desk left off: same playhead, same
+  // clock, same reveal card. The narrative is re-rendered rather than assumed
+  // still on screen, because it may have arrived while the preview held the card
+  // closed.
+  function exitPreview() {
+    if (!preview) return;
+    const saved = preview.saved;
+    preview = null;
+    el("backtodesk").classList.add("hidden");
+
+    rebuildTo(saved.playhead);
+    playClock = saved.playClock;
+    summaryShown = saved.summaryShown;
+    htSummaryShown = saved.htSummaryShown;
+    pausedForHt = saved.pausedForHt;
+    currentReveal = saved.currentReveal;
+    playing = saved.playing;
+    pauseUntil = saved.pauseUntil;
+    lastTs = null;
+    updatePlayBtn();
+    if (saved.playhead > 0) clockEl.textContent = clock(events[saved.playhead - 1]) + "'";
+    setStatus(saved.status, saved.statusUp);
+
+    if (saved.revealVisible) {
+      el("summary").classList.remove("hidden");
+      if (currentReveal === "ht" && htNarrative) renderDesk(htNarrative);
+      else if (currentReveal === "ft" && ftNarrative) renderDesk(ftNarrative);
+    }
   }
 
   function updatePossSplitVisibility() {
@@ -1050,9 +1282,11 @@ INDEX_HTML = """<!doctype html>
     }
     clockEl.textContent = clock(e) + "'";
     // Auto-pause on a goal, a chance, or the half-time whistle. Full time needs
-    // no pause here -- reaching the last event reveals the summary.
+    // no pause here -- reaching the last event reveals the summary. Suppressed
+    // while a rebuild or a preview is in flight: the caller decides what is on
+    // screen, so redrawing the pitch must never raise a card on its own.
 
-    if (e.type === "half_time" && !htSummaryShown) {
+    if (e.type === "half_time" && !htSummaryShown && !suppressCards) {
       if (htData && HOME) {
         renderHtSummary(htData);
       } else {
@@ -1092,6 +1326,7 @@ INDEX_HTML = """<!doctype html>
   }
 
   function maybeReveal() {
+    if (preview) return;   // a preview is a detour: it does not raise the full-time card
     if (summaryShown || !summaryData || !doneFlag || playhead < events.length) return;
     renderSummary(summaryData);
     summaryShown = true;
@@ -1108,11 +1343,28 @@ INDEX_HTML = """<!doctype html>
     const dt = Math.min((ts - lastTs) / 1000, 0.1);
     lastTs = ts;
     if (playing && ts >= pauseUntil) {
-      playClock += dt * speed;
+      playClock += dt * (preview ? PREVIEW_SPEED : speed);
       advance(ts);
     }
+    stepPreview(ts);
     maybeReveal();
     requestAnimationFrame(frame);
+  }
+
+  // A preview always resolves. Once the cited event is on the pitch it freezes,
+  // holds long enough to be read, and then hands control back -- and the "back to
+  // the desk" button covers the case where the viewer pauses first. There is no
+  // state a viewer can reach from a claim that leaves them with no next move.
+  function stepPreview(ts) {
+    if (!preview) return;
+    if (preview.dwellUntil === 0 && playhead > preview.targetIdx) {
+      preview.dwellUntil = ts + PREVIEW_DWELL_MS;
+      playing = false;
+      updatePlayBtn();
+      setStatus("showing the cited moment", true);
+    } else if (preview.dwellUntil && ts >= preview.dwellUntil) {
+      exitPreview();
+    }
   }
 
   // ---- controls --------------------------------------------------------- //
@@ -1145,6 +1397,17 @@ INDEX_HTML = """<!doctype html>
     for (const [name, s] of CURATED) opt(String(s), name + " · seed " + s);
     sel.value = String(DEFAULT_SEED);   // show the match actually on screen
   }
+
+  // ---- the preview's exits ------------------------------------------------ //
+  el("backtodesk").onclick = (e) => { e.stopPropagation(); exitPreview(); };
+  // Escape always resolves to something known: leave a preview if one is running,
+  // otherwise dismiss the reveal. Whatever the viewer has clicked into, there is a
+  // keyboard route back and no state can strand them.
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (preview) exitPreview();
+    else if (!el("summary").classList.contains("hidden")) el("summary").click();
+  });
 
   el("replay").onclick = () => resetPlayback();
   // The full-time card is a reveal, not a trap: click the backdrop to go back to
@@ -1191,7 +1454,9 @@ INDEX_HTML = """<!doctype html>
     if (awayPct) awayPct.textContent = "";
     htSummaryShown = false; pausedForHt = false;
     currentReveal = null;
+    preview = null; suppressCards = false;
     el("summary").classList.add("hidden");
+    el("backtodesk").classList.add("hidden");
   }
 
   function connect(seed) {

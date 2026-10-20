@@ -71,13 +71,28 @@ simulator.py    Synthetic match generator (observable events + latent ground tru
 metrics.py      Interpret stage: observable events -> MatchState / MatchSummary
 explainer.py    Explain stage: key moments + cited reasons, scored against truth
 overlay.py      Render stage: insights -> timed overlay payloads
+llm.py          The only module that opens a socket: provider plans (Azure
+                OpenAI / GitHub Models), endpoint normalisation, one JSON-mode
+                POST. Fails soft by returning None instead of raising
+narrator.py     Narrator stage: the grounded desk -- four gates, plus local and
+                LLM providers behind one interface
+verifier.py     Verify stage: the critic. Rules each claim supported /
+                misattributed / unsupported, drops what it rejects, records the
+                reason, and never writes a sentence of its own
 pass_classifier.py  Phase-2 classifier: pass intent from geometry alone
+agents.py       Agent layer: named roles, declared contracts (reads/writes), one
+                shared blackboard, and a trace of who ran and how it went
 validate.py     Calibration harness: does the synthetic data look like football?
 test_events.py  Invariant tests: is the event stream semantically correct?
 test_metrics.py Tests: can the match be rebuilt from observables alone?
 test_pass_classifier.py  Does intent recovery actually work?
 test_explainer.py        Are the cited claims real, past, and honest?
 test_overlay.py          Does every moment render exactly once, in order?
+test_llm.py              Do the provider plans resolve, and do they fail soft?
+test_narrator.py         Do the four gates hold, and does the desk fail soft?
+test_verifier.py         Does a ruling join back to its claim, and does an
+                         unreadable ruling leave the claim standing?
+test_agents.py           Do the contracts bind, and does a failure stay visible?
 server.py       Web surface: FastAPI + SSE console (pitch, live strip, ticker,
                 full-time summary) — one long-lived stream, no build step
 ```
@@ -280,6 +295,9 @@ python simulator.py        # generate one match and print a summary
 python metrics.py          # interpret one match; print the full-time summary
 python explainer.py        # score the explanations, then show one match's key moments
 python overlay.py          # print one match's timed overlay timeline
+python narrator.py 81 --live   # ask the desk for one reveal (needs a provider)
+python verifier.py 81          # have the attribution critic rule on that draft
+python verifier.py 81 --live   # and again with whatever .env configures
 python pass_classifier.py  # recover pass intent from geometry; print the scores
 python validate.py 120     # calibration report over 120 matches
 python test_events.py      # invariant tests on the event stream
@@ -287,6 +305,10 @@ python test_metrics.py     # tests: the match rebuilt from observables alone
 python test_pass_classifier.py   # tests: intent recovered, no truth leaked
 python test_explainer.py   # tests: cited claims are real, past and honest
 python test_overlay.py     # tests: every moment renders once, in order
+python test_llm.py         # tests: plans resolve, and fail soft when they cannot
+python test_narrator.py    # tests: the four gates, and the soft fallback
+python test_verifier.py    # tests: rulings join to claims, doubt keeps claims
+python test_agents.py      # tests: contracts bind, failures stay visible
 
 python -m uvicorn server:app --reload   # the console, at http://127.0.0.1:8000
 ```
@@ -525,8 +547,10 @@ Phase 0 complete, and Phase 0.6 (the stat bundle) with it:
   closed `EventSource` could no longer re-send. It is now cleared on a *new match*
   and kept on replay, like the full-time summary.
 
-Next — score `control` / `chaos` against `control_true` / `chaos_true`, then the
-Narrator (one LLM call at full time, `LocalNarrator` fallback first).
+Next — score the critic: a labelled set of mutated claims, to measure what the
+Verifier catches and what it wrongly rejects. Then the orchestration trace panel,
+so the six agents and their handoffs are visible in the console rather than only
+on the wire.
 
 All clubs, players and matches are fictional. No real football data, trademarks
 or match footage are used.

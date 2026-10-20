@@ -63,13 +63,12 @@ import json
 import os
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 import httpx
-from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
 
+from llm import ChatJsonClient, HttpPlan, provider_plan, strip_fences
 from schemas import (
     Insight,
     InsightKind,
@@ -80,11 +79,6 @@ from schemas import (
     Reveal,
     RevealNarrative,
 )
-
-# Load .env for local development. `override=False` (the default) means a real
-# environment variable always wins, so a container or CI setting is never
-# silently replaced by a stray file on disk.
-load_dotenv()
 
 PERSONA_ORDER = (PersonaId.ANALYST, PersonaId.DIEHARD, PersonaId.NUMBERS)
 
@@ -246,7 +240,7 @@ def allowed_numbers(ctx: NarrativeContext) -> set[str]:
     be used by a sentence that cites nothing.
     """
     allowed: set[str] = set()
-    _collect_numbers(_facts_for_prompt(ctx.summary), allowed)
+    _collect_numbers(facts_for_prompt(ctx.summary), allowed)
     for insight in ctx.insights:
         allowed.update(_NUM.findall(insight.headline))
         allowed.add(str(insight.minute))
@@ -277,7 +271,7 @@ def _scoped_numbers(
     numbers, rather than letting any supplied figure be attached to any subject.
     """
     summary_numbers: set[str] = set()
-    _collect_numbers(_facts_for_prompt(ctx.summary), summary_numbers)
+    _collect_numbers(facts_for_prompt(ctx.summary), summary_numbers)
 
     per_event: dict[str, set[str]] = {}
     for insight in ctx.insights:
@@ -393,7 +387,7 @@ OUTPUT SHAPE (exactly this)
 Give all three personas, in that order, with two to three claims each."""
 
 
-def _facts_for_prompt(summary: MatchSummary) -> dict:
+def facts_for_prompt(summary: MatchSummary) -> dict:
     """The summary rewritten with human names as keys.
 
     The model reads names, not ids, and this is the only shape of the facts it
@@ -471,7 +465,7 @@ def build_user_prompt(ctx: NarrativeContext) -> str:
     payload = {
         "reveal": "half-time" if ctx.reveal is Reveal.HALF_TIME else "full-time",
         "minute": ctx.clock_s // 60,
-        "match_facts": _facts_for_prompt(ctx.summary),
+        "match_facts": facts_for_prompt(ctx.summary),
         "key_moments": _moments_for_prompt(ctx),
         "citable_event_ids": sorted(citable_event_ids(ctx.insights)),
     }
@@ -491,14 +485,6 @@ class NarrativeParseError(ValueError):
     """The model's output was not the JSON object this stage requires."""
 
 
-def _strip_fences(raw: str) -> str:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z0-9]*\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    return text.strip()
-
-
 def parse_personas(raw: str) -> list[PersonaTake]:
     """Parse the model's JSON into validated `PersonaTake` objects.
 
@@ -507,7 +493,7 @@ def parse_personas(raw: str) -> list[PersonaTake]:
     "carry on with whatever we got".
     """
     try:
-        data = json.loads(_strip_fences(raw))
+        data = json.loads(strip_fences(raw))
     except json.JSONDecodeError as exc:
         raise NarrativeParseError(f"not JSON: {exc}") from exc
     if not isinstance(data, dict) or not isinstance(data.get("personas"), list):
@@ -636,24 +622,12 @@ class LocalNarrator:
 # --------------------------------------------------------------------------- #
 
 
-@dataclass(frozen=True)
-class HttpPlan:
-    """Everything provider-specific, resolved once at startup."""
-
-    provider: str
-    url: str
-    headers: dict[str, str]
-    body_model: str | None     # value for the request's "model" field, if any
-    model_label: str           # what we record in the narrative
-
-
 class ChatCompletionsNarrator:
     """A narrator backed by an OpenAI-compatible chat-completions endpoint.
 
-    The same class serves Azure OpenAI and GitHub Models; the only differences
-    are the URL, the auth header and whether the model travels in the body --
-    all of which live in an `HttpPlan`. That is what makes the provider a config
-    choice rather than a code change.
+    The provider plumbing (endpoint, auth, model label) and the HTTP call itself
+    live in `llm.py`; what is left here is the part that is really about
+    narrative -- the prompt, the parse, and the gates.
     """
 
     def __init__(self, plan: HttpPlan, timeout_s: float = 30.0,
@@ -669,48 +643,17 @@ class ChatCompletionsNarrator:
         self.temperature = temperature
         # `transport` exists so tests can drive the real request path against a
         # scripted response. Production passes nothing and gets a real socket.
-        self._client = httpx.AsyncClient(timeout=timeout_s, transport=transport)
+        self._llm = ChatJsonClient(
+            plan, timeout_s=timeout_s, temperature=temperature,
+            max_tokens=max_tokens, transport=transport,
+        )
 
     async def aclose(self) -> None:
-        await self._client.aclose()
-
-    def _payload(self, ctx: NarrativeContext, json_mode: bool) -> dict:
-        payload: dict = {
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": build_user_prompt(ctx)},
-            ],
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-        }
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        if self.plan.body_model:
-            payload["model"] = self.plan.body_model
-        return payload
-
-    async def _post(self, ctx: NarrativeContext) -> str:
-        """Return the raw assistant text, retrying once without JSON mode.
-
-        `response_format` is supported by the current chat models but not by
-        every endpoint; the retry keeps a 400 about that field from costing us
-        the reveal.
-        """
-        response = await self._client.post(
-            self.plan.url, headers=self.plan.headers, json=self._payload(ctx, True)
-        )
-        if response.status_code == 400 and "response_format" in response.text:
-            response = await self._client.post(
-                self.plan.url, headers=self.plan.headers,
-                json=self._payload(ctx, False),
-            )
-        response.raise_for_status()
-        body = response.json()
-        return body["choices"][0]["message"]["content"] or ""
+        await self._llm.aclose()
 
     async def narrate(self, ctx: NarrativeContext) -> RevealNarrative:
         try:
-            raw = await self._post(ctx)
+            raw = await self._llm.complete(SYSTEM_PROMPT, build_user_prompt(ctx))
             takes = parse_personas(raw)
         except Exception as exc:  # noqa: BLE001 -- any failure means "fall back"
             print(f"[narrator] {self.provider} call failed ({type(exc).__name__}: "
@@ -762,61 +705,9 @@ class ChatCompletionsNarrator:
 # --------------------------------------------------------------------------- #
 # Configuration: turning the environment into a narrator
 # --------------------------------------------------------------------------- #
-
-
-def _normalize_endpoint(endpoint: str) -> str:
-    """Reduce a pasted endpoint URL to the bare origin we append paths to.
-
-    Copying from the Azure or Foundry portal usually hands you the *full* URL for
-    one operation, e.g. ``https://res.services.ai.azure.com/openai/v1/responses``.
-    Appending our own path to that yields ``/openai/v1/responses/openai/v1/
-    chat/completions`` and an opaque ``404 Resource not found`` that looks exactly
-    like a missing deployment. Trimming at the first API segment makes the portal's
-    copy button harmless. The host is never touched -- ``.openai.azure.com`` is a
-    domain, not a path segment, so only ``/openai`` and ``/api`` are cut.
-    """
-    endpoint = endpoint.strip().rstrip("/")
-    for marker in ("/openai/", "/api/", "/openai", "/api"):
-        idx = endpoint.find(marker)
-        if idx != -1:
-            return endpoint[:idx].rstrip("/")
-    return endpoint
-
-
-def _azure_plan() -> HttpPlan:
-    endpoint = _normalize_endpoint(os.environ["AZURE_OPENAI_ENDPOINT"])
-    key = os.environ["AZURE_OPENAI_API_KEY"]
-    deployment = os.environ["AZURE_OPENAI_DEPLOYMENT"]
-    api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "").strip()
-    if api_version:
-        url = (f"{endpoint}/openai/deployments/{deployment}"
-               f"/chat/completions?api-version={api_version}")
-    else:
-        # The OpenAI-compatible v1 surface needs no api-version at all.
-        url = f"{endpoint}/openai/v1/chat/completions"
-    return HttpPlan(
-        provider="azure",
-        url=url,
-        headers={"Content-Type": "application/json", "api-key": key},
-        body_model=deployment,
-        model_label=deployment,
-    )
-
-
-def _github_plan() -> HttpPlan:
-    token = os.environ["GITHUB_MODELS_TOKEN"]
-    model = os.environ.get("GITHUB_MODELS_MODEL", "openai/gpt-4o-mini")
-    return HttpPlan(
-        provider="github",
-        url="https://models.github.ai/inference/chat/completions",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-        },
-        body_model=model,
-        model_label=model,
-    )
+# The endpoint, the auth header and the model label are resolved in `llm.py`.
+# What is left here is the narrator's own settings, and the one decision that is
+# genuinely its own: whether to speak at all.
 
 
 def narrator_from_env() -> "Narrator":
@@ -825,20 +716,12 @@ def narrator_from_env() -> "Narrator":
     An unset or misconfigured provider is not an error the demo should die of --
     it is a reason to use the deterministic narrator.
     """
-    provider = os.environ.get("TOUCHLINE_LLM_PROVIDER", "local").strip().lower()
     timeout = float(os.environ.get("TOUCHLINE_LLM_TIMEOUT_S", "30"))
     max_tokens = int(os.environ.get("TOUCHLINE_LLM_MAX_TOKENS", "700"))
     temperature = float(os.environ.get("TOUCHLINE_LLM_TEMPERATURE", "0.3"))
 
-    if provider == "local":
-        return LocalNarrator()
-    try:
-        plan = {"azure": _azure_plan, "github": _github_plan}[provider]()
-    except KeyError:
-        print(f"[narrator] unknown provider {provider!r}; using local")
-        return LocalNarrator()
-    except (KeyError, ValueError) as exc:
-        print(f"[narrator] {provider} is missing config ({exc}); using local")
+    plan = provider_plan()
+    if plan is None:
         return LocalNarrator()
     print(f"[narrator] provider={plan.provider} model={plan.model_label}")
     return ChatCompletionsNarrator(
