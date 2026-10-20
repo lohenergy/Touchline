@@ -622,6 +622,63 @@ INDEX_HTML = """<!doctype html>
       100% { box-shadow: 0 0 0 16px rgba(159, 208, 255, 0); }
     }
     .pulse { animation: pulse .85s ease-out 2; border-radius: 8px; }
+
+    /* Orchestration trace panel */
+    .orchestration {
+      margin-top: 1rem;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #0e141c;
+      overflow: hidden;
+    }
+    .orch-head {
+      padding: .5rem .7rem;
+      background: #0f151d;
+      border-bottom: 1px solid var(--line);
+      font-size: .78rem;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: #cbd5e1;
+    }
+    .orch-body {
+      padding: .5rem .7rem;
+      display: flex;
+      flex-direction: column;
+      gap: .25rem;
+    }
+    .orch-row {
+      display: grid;
+      grid-template-columns: 5rem 8rem 6rem 1fr;
+      gap: .75rem;
+      align-items: baseline;
+      padding: .15rem 0;
+      border-bottom: 1px solid var(--line);
+      font-size: .76rem;
+    }
+    .orch-row:last-of-type { border-bottom: none; }
+    .orch-status {
+      color: var(--mut);
+      text-transform: uppercase;
+      font-size: .7rem;
+      letter-spacing: .08em;
+    }
+    .orch-row.ok .orch-status { color: #6ee7a0; }
+    .orch-row.failed .orch-status { color: #f79a9a; }
+    .orch-agent { color: #9fd0ff; }
+    .orch-calls { color: var(--mut); }
+    .orch-detail { color: #c9d4df; white-space: normal; }
+    .orch-foot {
+      margin-top: .3rem;
+      padding-top: .4rem;
+      border-top: 1px solid var(--line);
+      color: var(--mut);
+      font-size: .74rem;
+    }
+
+    .app-footer {
+      margin-top: 1.2rem;
+      margin-bottom: 2rem;
+    }
   </style>
 </head>
 <body>
@@ -673,6 +730,13 @@ INDEX_HTML = """<!doctype html>
   </section>
 
   <ol id="feed"><li class="empty">waiting for the first event…</li></ol>
+
+  <footer class="app-footer">
+    <section id="orchestration" class="orchestration">
+      <div class="orch-head">Orchestration — agent trace</div>
+      <div id="orch-body" class="orch-body">Waiting for match to complete…</div>
+    </section>
+  </footer>
 
   <div id="summary" class="overlay hidden">
     <div class="card">
@@ -735,7 +799,7 @@ INDEX_HTML = """<!doctype html>
   let speed = 30;            // match-seconds per real second
   let lastTs = null;         // null until the first animation frame
   let pauseUntil = 0;        // auto-pause deadline, ms
-  let summaryData = null, htData = null, doneFlag = false, summaryShown = false, htSummaryShown = false, pausedForHt = false;
+  let summaryData = null, htData = null, doneFlag = false, traceData = null, summaryShown = false, htSummaryShown = false, pausedForHt = false;
   let htNarrative = null, ftNarrative = null;   // the desk's reading at each reveal
   let currentReveal = null;                     // "ht" | "ft" -- which card is open
   let lastPossTeam = null;   // for detecting possession-change moments
@@ -1351,7 +1415,43 @@ INDEX_HTML = """<!doctype html>
     requestAnimationFrame(frame);
   }
 
-  // A preview always resolves. Once the cited event is on the pitch it freezes,
+  // traceData declared above with other state variables
+  function renderOrchestration() {
+    const body = document.getElementById("orch-body");
+    if (!body) return;
+    if (!traceData || !traceData.trace) {
+      body.textContent = "Waiting for match to complete…";
+      return;
+    }
+    body.innerHTML = "";
+    for (const r of traceData.trace) {
+      const row = document.createElement("div");
+      row.className = "orch-row " + (r.status || "");
+      const status = document.createElement("span");
+      status.className = "orch-status";
+      status.textContent = r.status;
+      const agent = document.createElement("span");
+      agent.className = "orch-agent";
+      agent.textContent = r.agent;
+      const calls = document.createElement("span");
+      calls.className = "orch-calls";
+      calls.textContent = (r.calls != null ? r.calls + " calls" : "");
+      const detail = document.createElement("span");
+      detail.className = "orch-detail";
+      detail.textContent = r.detail || "";
+      row.appendChild(status);
+      row.appendChild(agent);
+      row.appendChild(calls);
+      row.appendChild(detail);
+      body.appendChild(row);
+    }
+    if (traceData.disputed_claims != null) {
+      const d = document.createElement("div");
+      d.className = "orch-foot";
+      d.textContent = "Verifier: " + traceData.disputed_claims + " disputed claim(s)";
+      body.appendChild(d);
+    }
+  }
   // holds long enough to be read, and then hands control back -- and the "back to
   // the desk" button covers the case where the viewer pauses first. There is no
   // state a viewer can reach from a claim that leaves them with no next move.
@@ -1409,7 +1509,7 @@ INDEX_HTML = """<!doctype html>
     else if (!el("summary").classList.contains("hidden")) el("summary").click();
   });
 
-  el("replay").onclick = () => resetPlayback();
+  el("replay").onclick = () => { traceData = null; renderOrchestration(); resetPlayback(); };
   // The full-time card is a reveal, not a trap: click the backdrop to go back to
   // the pitch. Replay or a new match will reveal it again.
   el("summary").onclick = (ev) => {
@@ -1464,7 +1564,7 @@ INDEX_HTML = """<!doctype html>
     events.length = 0;
     stateFrames.length = 0;
     for (const k in overlayByAnchor) delete overlayByAnchor[k];
-    summaryData = null; doneFlag = false;
+    summaryData = null; htData = null; doneFlag = false; traceData = null; summaryShown = false; htSummaryShown = false; pausedForHt = false;
     // A new match invalidates the buffered halves. Replay must *keep* them --
     // the EventSource is already closed by then, so there is nothing to re-fetch
     // them from, and clearing them left the half-time card empty on replay.
@@ -1515,7 +1615,11 @@ INDEX_HTML = """<!doctype html>
         if (currentReveal === "ft") renderDesk(n);
       }
     });
-    es.addEventListener("done", () => { doneFlag = true; if (es) es.close(); });
+    es.addEventListener("done", (msg) => {
+      try { traceData = JSON.parse(msg.data); renderOrchestration(); } catch(e) {}
+      doneFlag = true;
+      if (es) es.close();
+    });
     es.onerror = () => setStatus("reconnecting…", false);
   }
 

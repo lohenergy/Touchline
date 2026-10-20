@@ -552,5 +552,40 @@ Verifier catches and what it wrongly rejects. Then the orchestration trace panel
 so the six agents and their handoffs are visible in the console rather than only
 on the wire.
 
-All clubs, players and matches are fictional. No real football data, trademarks
-or match footage are used.
+## The Verifier: criticize, don't rewrite
+
+`verifier.py` is the critic stage. A second pass — never chained to the Desk's
+write — checks claims against the ground truth from the simulator/metrics and
+attaches rulings by structural position (via `claim_id` on the roster), never by
+text matching. 
+
+- **Disputes, not deletions.** The schema carries `disputed_claims` and embedded
+  `ruling` objects. A ruling may be `supported`, `misattributed`, or
+  `unsupported`. Claims are never dropped wholesale; disputes are surfaced.
+- **Four gates** still apply to the desk (`narrator.py`): temporal validity,
+  event existence, specificity, and attribution discipline.
+- **Omission is not an error.** The Verifier agrees before it rejects; it does
+  like-with-like and reasons in terms of the provided events/insights.
+- **Measurable precision/recall.** `eval_verifier.py` runs a labelled harness
+  with untouched true claims as false-positive probes and corrupted mutations
+  (team swaps, wrong numbers/players/locations). Run with `TOUCHLINE_LLM_PROVIDER=local`
+  for the local critic or `--live` with configured providers.
+
+## Agentic orchestration
+
+`agents.py` defines named roles (`GENERATE`, `INTERPRET`, `EXPLAIN`, `RENDER`,
+`DESK`, `VERIFY`) with declared contracts (reads/writes), a shared blackboard,
+and a trace. `server.py` assembles them into a pipeline and exposes an
+**orchestration trace panel** in the UI (from the `done` frame). The trace shows
+each agent's status/calls/detail and the number of disputed claims surfaced by
+the Verifier.
+
+## Public repo readiness
+
+- `.env.example` documents required/optional environment variables (no secrets).
+- `LICENSE` included (MIT).
+- All clubs, players and matches are fictional. No real football data,
+  trademarks or match footage are used. No betting/productisation of odds/value
+  analysis; any value/odds framing appears only as model-vs-market
+  explainability if at all. The demo is a local recording — no Azure deployment
+  is executed as part of the demo path.
