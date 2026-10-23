@@ -378,6 +378,17 @@ async def _stream_match(seed: int) -> AsyncIterator[str]:
     )
     if frame:
         yield frame
+
+    # The full-time narrative is the one the done frame describes. Reading it back
+    # from the board (rather than recomputing) means the trace panel can never
+    # report a dispute count that belongs to a different draft than the one on
+    # screen. `disputed_claims` is surfaced, not deleted: the count says how many
+    # claims the critic ruled against, and those claims still arrive with their
+    # rulings attached.
+    # Only trust the latest narrative when the full-time frame was actually sent;
+    # otherwise the board still holds the half-time one and its count would be
+    # attributed to the wrong reveal.
+    final_narrative = board.latest("narrative") if frame else None
     yield _sse(
         "done",
         json.dumps(
@@ -386,9 +397,14 @@ async def _stream_match(seed: int) -> AsyncIterator[str]:
                     "home": sim.score[home_id],
                     "away": sim.score[away_id],
                 },
-                # Who did what, in handoff order. The web page ignores this; the
-                # trace panel and the tests are the two readers that don't.
+                # Who did what, in handoff order. The trace panel and the tests are
+                # the two readers of this.
                 "trace": board.trace.snapshot(),
+                "disputed_claims": (
+                    final_narrative.disputed_claims
+                    if final_narrative is not None
+                    else None
+                ),
             }
         ),
     )

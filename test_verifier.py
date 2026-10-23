@@ -126,7 +126,11 @@ def controlled_draft():
         ],
     )
     base = local_narrative(ctx)
-    return ctx, base.model_copy(update={"personas": [take]})
+    # Rebuild through the constructor rather than `model_copy`, so the roster
+    # validator runs and numbers the three claims 0, 1, 2. A copied draft keeps
+    # the source ids, which would give every claim here the same id and make the
+    # "which claim did the critic rule on?" assertions meaningless.
+    return ctx, RevealNarrative(**{**base.model_dump(), "personas": [take.model_dump()]})
 
 
 def fallbacks(ctx):
@@ -487,7 +491,13 @@ def test_a_full_model_review_is_verified() -> None:
     final = apply_verdicts(draft, review)
     assert final.verified is True
     assert final.disputed_claims == 1
-    assert [c.text for c in final.personas[0].claims] == ["First claim.", "Third claim."]
+    # Claims are kept: the disputed one stays on the desk with its ruling attached,
+    # rather than vanishing and leaving only a count behind.
+    assert [c.text for c in final.personas[0].claims] == [
+        "First claim.", "Second claim.", "Third claim."
+    ]
+    assert final.personas[0].claims[1].ruling is not None
+    assert final.personas[0].claims[1].ruling.verdict is Verdict.MISATTRIBUTED
 
 
 def test_the_critic_runs_cold() -> None:
