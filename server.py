@@ -1525,7 +1525,11 @@ INDEX_HTML = """<!doctype html>
     else if (!el("summary").classList.contains("hidden")) el("summary").click();
   });
 
-  el("replay").onclick = () => { traceData = null; renderOrchestration(); resetPlayback(); };
+  // Replay rewinds this match's playback, not the match itself, so the agent
+  // trace already received still describes what is on screen. Clearing it left
+  // the panel reading "waiting for match to complete…" forever, because the
+  // stream has already closed and cannot send the trace again.
+  el("replay").onclick = () => resetPlayback();
   // The full-time card is a reveal, not a trap: click the backdrop to go back to
   // the pitch. Replay or a new match will reveal it again.
   el("summary").onclick = (ev) => {
@@ -1591,6 +1595,9 @@ INDEX_HTML = """<!doctype html>
     setStatus("connecting…", false);
     el("strip").classList.add("hidden");
     resetPlayback();
+    // A new match has no trace yet: clear the panel now rather than leaving the
+    // previous match's agents on screen until this run's `done` frame arrives.
+    renderOrchestration();
 
     es = new EventSource("/events?seed=" + seed);
     es.addEventListener("meta", (msg) => {

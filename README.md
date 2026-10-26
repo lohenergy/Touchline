@@ -4,6 +4,22 @@ Match intelligence that explains *why* a moment mattered — and can prove it.
 
 Built for the **Microsoft Inside the Game: Developer Hackathon** (Oct 2026).
 
+## Demo
+
+▶ **[Watch the 2-minute walkthrough](https://youtu.be/cxZFeOUeVKA)**
+
+A screen recording of a local run: synthetic match data, no deployment, no
+network. Things to look for:
+
+- **The provenance chip** on the desk — which model wrote the copy, or the
+  deterministic fallback when no provider is configured.
+- **A key moment's receipts** — hover the "why" line in the ticker to see the
+  event IDs the claim is true because of.
+- **"Show me"** — replays the build-up to a cited moment, then hands the viewer
+  back to the desk.
+- **The orchestration trace** — six agents, their statuses and call counts, and
+  the Verifier's disputed-claim count.
+
 ---
 
 ## The problem
@@ -77,8 +93,9 @@ llm.py          The only module that opens a socket: provider plans (Azure
 narrator.py     Narrator stage: the grounded desk -- four gates, plus local and
                 LLM providers behind one interface
 verifier.py     Verify stage: the critic. Rules each claim supported /
-                misattributed / unsupported, drops what it rejects, records the
-                reason, and never writes a sentence of its own
+                misattributed / unsupported by the claim's roster id, attaches
+                the ruling to the claim, surfaces disputes rather than deleting
+                them, and never writes a sentence of its own
 pass_classifier.py  Phase-2 classifier: pass intent from geometry alone
 agents.py       Agent layer: named roles, declared contracts (reads/writes), one
                 shared blackboard, and a trace of who ran and how it went
@@ -298,6 +315,8 @@ python overlay.py          # print one match's timed overlay timeline
 python narrator.py 81 --live   # ask the desk for one reveal (needs a provider)
 python verifier.py 81          # have the attribution critic rule on that draft
 python verifier.py 81 --live   # and again with whatever .env configures
+python eval_verifier.py        # score the critic: precision, recall, false positives
+python eval_verifier.py --live # the same labelled probes against the model critic
 python pass_classifier.py  # recover pass intent from geometry; print the scores
 python validate.py 120     # calibration report over 120 matches
 python test_events.py      # invariant tests on the event stream
@@ -315,6 +334,17 @@ python -m uvicorn server:app --reload   # the console, at http://127.0.0.1:8000
 
 `validate.py` exits non-zero if any metric falls outside its reference range, so
 it can gate CI. `test_events.py` does the same for the invariants below.
+
+To run the console exactly as the demo does — offline, with the deterministic
+desk and the attribution-only critic — set the provider explicitly:
+
+```bash
+TOUCHLINE_LLM_PROVIDER=local python -m uvicorn server:app --reload
+```
+
+Provider configuration is optional; with no `.env` and no provider variable the
+desk and critic fall back to their local implementations, and the page says so
+on the provenance chip.
 
 ## Two kinds of correctness, and why you need both
 
@@ -547,17 +577,34 @@ Phase 0 complete, and Phase 0.6 (the stat bundle) with it:
   closed `EventSource` could no longer re-send. It is now cleared on a *new match*
   and kept on replay, like the full-time summary.
 
-Next — score the critic: a labelled set of mutated claims, to measure what the
-Verifier catches and what it wrongly rejects. Then the orchestration trace panel,
-so the six agents and their handoffs are visible in the console rather than only
-on the wire.
+- **Phase 2 (Verifier, second pass)**: `verifier.py` reviews the desk's draft
+  without touching it. `apply_verdicts` attaches each ruling to the claim it
+  addresses, addressed by the claim's roster id, so a disputed sentence stays on
+  screen next to the fact the critic cited against it. `disputed_claims` counts
+  them; nothing is deleted. `test_verifier.py` pins the join (a ruling reaches
+  its claim, never a lookalike) and the failure mode (an unreadable review leaves
+  every claim standing and marks the reveal unverified).
+- **Phase 2 (critic evaluation harness)**: `eval_verifier.py` scores the critic
+  against a labelled set that includes untouched true claims as false-positive
+  probes and corrupted claims (team swaps, wrong numbers, wrong players, wrong
+  distances) as detection probes. The local critic is attribution-only, so it
+  catches contradictions it can see in the cited events but not every number or
+  name mutation; run it with `--live` to score the configured model critic
+  instead. Reporting precision separately from the false-positive rate is the
+  point: a critic that never objects would otherwise look perfect.
+- **Phase 2 (orchestration trace)**: the `done` frame carries the agent trace,
+  and the console renders it in a footer panel — one row per agent with status,
+  call count and a detail line, plus the Verifier's disputed-claim count. The
+  panel is observability, not a second control surface: it reports what ran, in
+  what order, and what it produced.
 
 ## The Verifier: criticize, don't rewrite
 
 `verifier.py` is the critic stage. A second pass — never chained to the Desk's
-write — checks claims against the ground truth from the simulator/metrics and
-attaches rulings by structural position (via `claim_id` on the roster), never by
-text matching. 
+write — checks claims against the same observable evidence the desk was given,
+and attaches rulings by structural position (via `claim_id` on the roster), never
+by text matching. It does not read the simulator's latent layer; a critic with
+privileged access could not be trusted to judge what the viewer can see.
 
 - **Disputes, not deletions.** The schema carries `disputed_claims` and embedded
   `ruling` objects. A ruling may be `supported`, `misattributed`, or
@@ -568,8 +615,11 @@ text matching.
   like-with-like and reasons in terms of the provided events/insights.
 - **Measurable precision/recall.** `eval_verifier.py` runs a labelled harness
   with untouched true claims as false-positive probes and corrupted mutations
-  (team swaps, wrong numbers/players/locations). Run with `TOUCHLINE_LLM_PROVIDER=local`
-  for the local critic or `--live` with configured providers.
+  (team swaps, wrong numbers/players/locations). The local critic is
+  attribution-only and sees the same cited ids on a mutated sentence, so it
+  catches contradictions but not every mutation; `--live` scores the configured
+  model critic. The harness reports precision, recall and the false-positive rate
+  separately, because "never objects" must not score as perfect.
 
 ## Agentic orchestration
 
